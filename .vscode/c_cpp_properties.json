@@ -1,0 +1,18 @@
+{
+  "configurations": [
+    {
+      "name": "MerdenOS",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/kernel/code/drivers/**",
+        "${workspaceFolder}/standarts_lib/**",
+        "${workspaceFolder}/kernel/headers/**"
+      ],
+      "defines": [],
+      "compilerPath": "",
+      "cStandard": "c11",
+      "intelliSenseMode": "gcc-x86"
+    }
+  ],
+  "version": 4
+}

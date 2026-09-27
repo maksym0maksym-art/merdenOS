@@ -1,0 +1,83 @@
+# MerdenOS Development Public License 1.0 (MDPL-1.0)
+
+Copyright (c) 2026 Maksm_y
+
+Project: MerdenOS
+Original Author: Maksm_y
+Official GitHub: https://github.com/maksym0maksym-art
+
+## 1. Definitions
+
+For the purposes of this License:
+
+* **Software** means the MerdenOS operating system and all files distributed as part of the official project.
+* **Original Author** means Maksm_y.
+* **Contributor** means any person whose contribution has been accepted into the official project.
+* **Modified Version** means any version that contains modifications to the Software.
+* **Distribution** means making the Software available to another person.
+
+## 2. Permissions
+
+You may:
+
+* use the Software for any purpose;
+* study the source code;
+* modify the Software;
+* compile the Software;
+* distribute original or modified versions.
+
+## 3. Source Code
+
+Any distributed binary must be accompanied by its complete corresponding source code or by a free method of obtaining that source code.
+
+## 4. Preservation of Freedom
+
+Any distributed Modified Version that contains substantial portions of the Software must also provide its complete corresponding source code.
+
+No distributor may impose additional restrictions preventing recipients from exercising the rights granted by this License.
+
+## 5. Attribution
+
+All copies and Modified Versions must retain:
+
+* this License;
+* copyright notices;
+* acknowledgements of the Original Author.
+
+Modified Versions must clearly state that they contain changes.
+
+## 6. Project Identity
+
+The names "Merden" and "MerdenOS" may be used by anyone.
+
+However, no person may falsely represent a modified version as an official release of the MerdenOS Project or claim endorsement by the Original Author without permission.
+
+## 7. Third-Party Components
+
+Software distributed under other licenses may be included in the project provided that their original license terms are fully respected.
+
+Nothing in this License is intended to override the terms of third-party licenses.
+
+## 8. Contributions
+
+Unless otherwise agreed in writing, all accepted contributions are licensed under this License.
+
+Contributors retain copyright to their own contributions.
+
+## 9. Warranty Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+
+THE AUTHORS SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE OF THE SOFTWARE.
+
+## 10. Termination
+
+Any person who violates this License immediately loses the rights granted by it until the violation is corrected.
+
+## 11. Future Versions
+
+The Original Author may publish future versions of this License.
+
+Projects may specify which version of this License they use.
+
+## END OF LICENSE

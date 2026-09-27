@@ -1,0 +1,14 @@
+remember name = "Maksm_y"
+
+say "Hello world, {name}"
+
+when name == "Maksm_y"{
+    say "Привіт, Макс"
+}
+otherwise{
+    say "Яке твоє ім'я?"
+}
+
+repeat(3){
+    say"Hello"
+}

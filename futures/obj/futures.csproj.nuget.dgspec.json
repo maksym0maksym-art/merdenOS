@@ -1,0 +1,82 @@
+{
+  "format": 1,
+  "restore": {
+    "/home/maksm_y/Документи/проекти/MerdenOS/futures/futures.csproj": {}
+  },
+  "projects": {
+    "/home/maksm_y/Документи/проекти/MerdenOS/futures/futures.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/home/maksm_y/Документи/проекти/MerdenOS/futures/futures.csproj",
+        "projectName": "futures",
+        "projectPath": "/home/maksm_y/Документи/проекти/MerdenOS/futures/futures.csproj",
+        "packagesPath": "/home/maksm_y/.nuget/packages/",
+        "outputPath": "/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/home/maksm_y/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net9.0"
+        ],
+        "sources": {
+          "/usr/lib64/dotnet/library-packs": {},
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net9.0": {
+            "targetAlias": "net9.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "9.0.100"
+      },
+      "frameworks": {
+        "net9.0": {
+          "targetAlias": "net9.0",
+          "dependencies": {
+            "Avalonia": {
+              "target": "Package",
+              "version": "[11.2.0, )"
+            },
+            "Avalonia.Desktop": {
+              "target": "Package",
+              "version": "[11.2.0, )"
+            },
+            "Avalonia.Themes.Fluent": {
+              "target": "Package",
+              "version": "[11.2.0, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/lib64/dotnet/sdk/9.0.118/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

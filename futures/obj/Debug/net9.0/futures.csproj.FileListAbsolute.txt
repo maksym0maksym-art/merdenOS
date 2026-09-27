@@ -1,0 +1,14 @@
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.csproj.AssemblyReference.cache
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/Avalonia/Resources.Inputs.cache
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/Avalonia/resources
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.GeneratedMSBuildEditorConfig.editorconfig
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.AssemblyInfoInputs.cache
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.AssemblyInfo.cs
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.csproj.CoreCompileInputs.cache
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.sourcelink.json
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/Avalonia/futures.dll
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/Avalonia/futures.pdb
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/refint/Avalonia/futures.dll
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.dll
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/refint/futures.dll
+/home/maksm_y/Документи/проекти/MerdenOS/futures/obj/Debug/net9.0/futures.pdb
