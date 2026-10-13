@@ -17,12 +17,12 @@
 #include "../../kernel/headers/mouse_cmd.h"
 #include "../../MerdenLanguage/merden.h"
 #include "graphic/console.h"
+#include "../GUI/gui.h"
+#include "../../kernel/headers/usbfs.h"
+#include "../../kernel/headers/klog.h"
 
 #define CHAR_WIDTH 8
 #define CHAR_HEIGHT 18 
-
-#define SCREEN_COLS 128
-#define SCREEN_ROW  42
 
 #define IDE_ATA    0x00
 #define IDE_ATAPI  0x01
@@ -36,10 +36,57 @@ int shell_row = 0;
 
 static int prompt_start_col = 0;
 
+/* ---- прототипи (щоб порядок визначень не мав значення) ---- */
 void shell_print(char *text);
 void shell_print_int(int num);
 int shell_atoi(const char *str);
 void shell_calculator(char *command);
+void shell_print_color(char *text, uint32_t color);
+void shell_redraw_line(const char *buf, int length, int new_cursor_pos);
+void shell_history_add(const char *cmd);
+void show_cursor(void);
+void hide_cursor(void);
+void shell_execute_command(char* command);
+void shell_print_f(char* text);
+void move_cursor(int x, int y);
+static void prompt_dir(char *out, int n);
+void uptime_mark_boot(void);
+uint64_t hardware_get_ram_installed_bytes(void);   /* має бути і в hardware.h */
+
+#define PROMPT_USER  "rose"
+#define PROMPT_HOST  "rose"
+#define PROMPT_LINE  0x0000FF      /* лінії, дужки, ">>" — колір, яким був старий промт */
+#define PROMPT_NAME  0x0000FF      /* імена, як у Kali, того ж кольору */
+#define PROMPT_DIR   0xFFFFFF      /* директорія біла, як ~ у Kali */
+
+/* "usb0:/dir" без кінцевого пробілу, а без USB-диска — "/" */
+static void prompt_dir(char *out, int n)
+{
+    const char *drv = usbfs_prompt();                 /* "usb0:/dir " з пробілом в кінці, або "" */
+    int len = 0;
+    while (drv[len] && len < n - 1) { out[len] = drv[len]; len++; }
+    while (len > 0 && out[len - 1] == ' ') len--;
+    out[len] = '\0';
+    if (len == 0) { out[0] = '/'; out[1] = '\0'; }
+}
+
+void shell_prompt(){
+    char dir[128];
+    prompt_dir(dir, sizeof dir);
+
+    /*  ┌──{rose🌹rose}-{usb0:/}
+     *  └─>>                      */
+    shell_print_color(GUI_BOX_TL_STR GUI_BOX_H_STR GUI_BOX_H_STR "{", PROMPT_LINE);
+    shell_print_color(PROMPT_USER, PROMPT_NAME);
+    shell_print_color(GUI_ROSE_STR, PROMPT_NAME);       /* троянда має власні кольори */
+    shell_print_color(PROMPT_HOST, PROMPT_NAME);
+    shell_print_color("}-{", PROMPT_LINE);
+    shell_print_color(dir, PROMPT_DIR);
+    shell_print_color("}\n", PROMPT_LINE);
+    shell_print_color(GUI_BOX_BL_STR GUI_BOX_H_STR ">> ", PROMPT_LINE);
+
+    prompt_start_col = shell_col;                        /* 5 клітинок: └ ─ > > пробіл */
+}
 
 #define PROMPT "liveuser@merden$ "
 #define BUFFER_SIZE 256
@@ -70,12 +117,15 @@ static int  editor_saved_col = 0;
 
 void shell_calculator(char *command)
 {
-    char *p = command + 5; // після "calculator"
+    char *p = command + 5; // після "calc "
 
     while (*p == ' ')
         p++;
 
     int first = shell_atoi(p);
+
+    if (*p == '-')
+        p++;
 
     while (*p >= '0' && *p <= '9')
         p++;
@@ -84,7 +134,8 @@ void shell_calculator(char *command)
         p++;
 
     char operation = *p;
-    p++;
+    if (*p)
+        p++;
 
     while (*p == ' ')
         p++;
@@ -117,18 +168,12 @@ void shell_calculator(char *command)
             break;
 
         default:
-            shell_print("Usage: calculator <number> <+|-|*|/> <number>\n");
+            shell_print("Usage: calc <number> <+|-|*|/> <number>\n");
             return;
     }
 
     shell_print_int(result);
     shell_print("\n");
-}
-void shell_print_f(char* text);
-
-void shell_prompt(){
-    shell_print_color(PROMPT,  0x0000FF);
-    prompt_start_col = shell_col;
 }
 
 short cursor_visible = 0;
@@ -183,10 +228,29 @@ void shell_print(char* text)
     console_puts_color(text, COLOR_WHITE);
 }
 
-void move_cursor(int x, int y);
+/* UTF-8 🌹 (F0 9F 8C B9) -> два символи GUI_ROSE_STR; решта байтів без змін */
+static void shell_print_utf8(const char *s)
+{
+    char buf[128];
+    int n = 0;
+    while (*s) {
+        if (n > (int)sizeof buf - 3) { buf[n] = '\0'; shell_print(buf); n = 0; }
+        if ((unsigned char)s[0] == 0xF0 && (unsigned char)s[1] == 0x9F &&
+            (unsigned char)s[2] == 0x8C && (unsigned char)s[3] == 0xB9) {
+            buf[n++] = (char)GUI_CH_ROSE_L;
+            buf[n++] = (char)GUI_CH_ROSE_R;
+            s += 4;
+        } else {
+            buf[n++] = *s++;
+        }
+    }
+    buf[n] = '\0';
+    shell_print(buf);
+}
 
 void shell_init()
 {
+        uptime_mark_boot();   // запам'ятовуємо момент старту для uptime у fetch
         clear_screen(0x000000);
         console_reset();
 
@@ -208,34 +272,6 @@ void move_cursor(int x, int y)
    (void)y;
 }
 
-/*void shell_putchar(char c)
-{
-    hide_cursor();
-
-    if (editor_mode)
-    {
-        if (editor_len < EDITOR_MAX - 1)
-        {
-            editor_buffer[editor_len++] = c;
-            editor_buffer[editor_len] = '\0';
-
-            char s[2] = {c, '\0'};
-            shell_print(s);
-        }
-    }
-
-    else if (command_index < BUFFER_SIZE - 1)
-    {
-        command_buffer[command_index++] = c;
-        command_buffer[command_index] = '\0';
-
-        char s[2] = {c, '\0'};
-        shell_print(s);
-    }
-
-    // Намалювати курсор на новій позиції
-    show_cursor();
-}*/
 void shell_putchar(char c)
 {
     hide_cursor();
@@ -277,33 +313,6 @@ void shell_print_color(char *text, uint32_t color)
     console_puts_color(text, color);
 }
 
-/*void shell_backspace()
-{
-    int *index_ptr = editor_mode ? &editor_len : &command_index;
-    char *buf = editor_mode ? editor_buffer : command_buffer;
-
-    if (*index_ptr > 0)
-    {
-
-        hide_cursor();
-
-        (*index_ptr)--;
-        buf[*index_ptr] = '\0';
-
-        shell_col--;
-
-        print_one_part(" ", shell_row, shell_col);
-        screen_buffers[shell_row][shell_col] = ' ';
-        move_cursor(shell_row, shell_col);
-        clear_char(
-            shell_col * CHAR_WIDTH,
-            shell_row * CHAR_HEIGHT
-        );
-
-        show_cursor();
-
-    }
-}*/
 void shell_backspace()
 {
     if (editor_mode)
@@ -384,8 +393,6 @@ void blink_cursor()
     }
 }
 
-void shell_execute_command(char* command);
-
 char* shell_trim(char* str)
 {
     if (!str) return str;
@@ -451,16 +458,6 @@ void shell_enter()
         shell_print(num_prefix);
         shell_print("| ");
 
-        if (!editor_mode)   // перевірка
-        {
-            shell_prompt();
-            show_cursor();
-        }
-        else
-        {
-            show_cursor();   // курсор все одно треба показати, просто без PROMPT
-        }
-
         show_cursor();
         return;
     }
@@ -482,35 +479,6 @@ void shell_enter()
         shell_prompt();
         show_cursor();
     }
-}
-
-void merdenfetch(void)
-{
-    shell_print("\n");
-
-    shell_print("  //\\_/\\\\        MerdenOS\n");
-    shell_print("  ( o.o )        ----------------\n");
-    shell_print("   > ^ <         Kernel    : Rose\n");
-
-    shell_print(" //     \\\\       Arch      : i686\n");
-
-    shell_print("                 Host      : ");
-    shell_print((char *)hardware_get_computer_name());
-    shell_print("\n");
-
-    shell_print("                 CPU       : ");
-    shell_print((char *)hardware_get_cpu_brand());
-    shell_print(" (");
-    shell_print_int(hardware_get_logical_cpus());
-    shell_print(" threads)\n");
-
-    shell_print("                 Shell     : merden-sh\n");
-    shell_print("                 Display   : Framebuffer\n");
-
-    shell_print("                 Memory    : ");
-    shell_print_int((int)(hardware_get_ram_bytes() / (1024 * 1024)));
-    shell_print(" MB\n");
-    shell_print("\n");
 }
 
 // Компактне лого (26x15), розбите на окремі рядки — щоб можна було
@@ -558,92 +526,347 @@ static void fetch_append_int(char *dst, int value)
     fetch_append(dst, buf);
 }
 
-// Склеює лого-рядок і рядок інфи в один рядок фіксованої ширини колонки лого.
-static void fetch_row(char *dst, const char *left, const char *right)
+/* ---------------- кольоровий fetch ---------------- */
+#define FETCH_USER      "liveuser"
+#define FETCH_HOST      "merden"
+#define FETCH_LABEL     0xFF3B3B   /* підписи й ім'я, як у neofetch */
+#define FETCH_WHITE     0xFFFFFF
+#define FETCH_BLOCK     "###"      /* "клітинка" палітри; якщо у шрифті є суцільний блок — підстав його */
+#define FETCH_FIELDS    9
+#define FETCH_MAX_DISKS 8
+#define FETCH_LINE_MAX  80
+
+/* Палітра 16 кольорів (перший — майже чорний, щоб було видно на чорному фоні) */
+static const uint32_t fetch_palette[16] = {
+    0x2A2A2A, 0xCC0000, 0x4E9A06, 0xC4A000, 0x3465A4, 0x75507B, 0x06989A, 0xD3D7CF,
+    0x555753, 0xEF2929, 0x8AE234, 0xFCE94F, 0x729FCF, 0xAD7FA8, 0x34E2E2, 0xEEEEEC,
+};
+
+/* Колір символу лого: щільніші символи яскравіші — виходить об'ємна форма */
+static uint32_t fetch_logo_color(char c)
 {
-    int i = 0;
-
-    while (left[i] && i < FETCH_LOGO_W)
+    switch (c)
     {
-        dst[i] = left[i];
-        i++;
+        case '@': return 0xFF5A5A;
+        case '%': return 0xF03C3C;
+        case '#': return 0xD82A2A;
+        case '*': return 0xB81E1E;
+        case '+': return 0x982222;
+        case '=': return 0x802424;
+        case '-': return 0x702828;
+        case '.': return 0x602424;
+    }
+    return FETCH_WHITE;
+}
+
+/* Друкує один рядок лого рівно в FETCH_LOGO_W + FETCH_GAP клітинок, групуючи однакові кольори */
+static void fetch_print_logo_line(const char *s)
+{
+    char run[FETCH_LOGO_W + FETCH_GAP + 1];
+    int n = 0, ended = 0;
+    uint32_t cur = FETCH_WHITE;
+
+    for (int i = 0; i < FETCH_LOGO_W + FETCH_GAP; i++)
+    {
+        char c = ' ';
+        if (!ended && i < FETCH_LOGO_W)
+        {
+            if (s[i]) c = s[i];
+            else      ended = 1;
+        }
+
+        uint32_t color = (c == ' ' && n) ? cur : fetch_logo_color(c);
+
+        if (n && color != cur)
+        {
+            run[n] = '\0';
+            shell_print_color(run, cur);
+            n = 0;
+        }
+
+        cur = color;
+        run[n++] = c;
     }
 
-    while (i < FETCH_LOGO_W + FETCH_GAP)
+    if (n)
     {
-        dst[i] = ' ';
-        i++;
+        run[n] = '\0';
+        shell_print_color(run, cur);
     }
+}
 
+static const char *const fetch_labels[FETCH_FIELDS] = {
+    "OS", "Kernel", "Uptime", "Arch", "Host", "CPU", "Memory", "Display", "Shell"
+};
+
+static char fetch_val_up[FETCH_LINE_MAX];
+static char fetch_val_host[FETCH_LINE_MAX];
+static char fetch_val_cpu[FETCH_LINE_MAX];
+static char fetch_val_mem[FETCH_LINE_MAX];
+static char fetch_val_res[FETCH_LINE_MAX];
+
+static const char *const fetch_values[FETCH_FIELDS] = {
+    "MerdenOS", "Rose", fetch_val_up, "i686",
+    fetch_val_host, fetch_val_cpu, fetch_val_mem, fetch_val_res,
+    "merden-sh"
+};
+
+static char fetch_disk[FETCH_MAX_DISKS][FETCH_LINE_MAX];
+static int  fetch_disk_count;
+
+/* Додає src в кінець dst, не виходячи за cap байтів (разом з '\0') */
+static void fetch_append_cap(char *dst, const char *src, int cap)
+{
+    int i = fetch_strlen(dst);
     int j = 0;
-    while (right[j])
-        dst[i++] = right[j++];
-
+    while (src[j] && i < cap - 1) dst[i++] = src[j++];
     dst[i] = '\0';
 }
 
-static char fetch_line_host[80];
-static char fetch_line_cpu[80];
-static char fetch_line_mem[80];
-static char fetch_line_res[80];
+/* "119 GB" / "512 MB" */
+static void fetch_append_size_mb(char *dst, unsigned int mb)
+{
+    char num[16];
+    if (mb >= 1024)
+    {
+        itoa((int)(mb / 1024), num);
+        fetch_append_cap(dst, num, FETCH_LINE_MAX);
+        fetch_append_cap(dst, " GB", FETCH_LINE_MAX);
+    }
+    else
+    {
+        itoa((int)mb, num);
+        fetch_append_cap(dst, num, FETCH_LINE_MAX);
+        fetch_append_cap(dst, " MB", FETCH_LINE_MAX);
+    }
+}
+
+/* Збирає список усіх дисків: IDE/ATA, ATAPI (CD/DVD) та USB-флешки */
+static void fetch_collect_disks(void)
+{
+    fetch_disk_count = 0;
+
+    for (int i = 0; i < 4 && fetch_disk_count < FETCH_MAX_DISKS; i++)
+    {
+        if (!ide_devices[i].Reserved)
+            continue;
+
+        char *line = fetch_disk[fetch_disk_count];
+        line[0] = '\0';
+
+        if (ide_devices[i].Type == IDE_ATAPI)
+        {
+            fetch_append_cap(line, "CD/DVD", FETCH_LINE_MAX);
+        }
+        else
+        {
+            fetch_append_cap(line, "HDD ", FETCH_LINE_MAX);
+            fetch_append_size_mb(line, (unsigned int)(ide_devices[i].Size / 2048)); /* сектори по 512 Б */
+        }
+
+        /* модель без кінцевих пробілів */
+        char model[44];
+        int m = 0;
+        while (ide_devices[i].Model[m] && m < (int)sizeof model - 1)
+        {
+            model[m] = ide_devices[i].Model[m];
+            m++;
+        }
+        while (m > 0 && model[m - 1] == ' ') m--;
+        model[m] = '\0';
+
+        if (m > 0)
+        {
+            fetch_append_cap(line, "  ", FETCH_LINE_MAX);
+            fetch_append_cap(line, model, FETCH_LINE_MAX);
+        }
+
+        fetch_disk_count++;
+    }
+
+    for (int i = 0; i < usbfs_drive_count() && fetch_disk_count < FETCH_MAX_DISKS; i++)
+    {
+        int d = usbfs_drive_at(i, 0, 0);
+        if (d < 0) continue;
+
+        char *line = fetch_disk[fetch_disk_count];
+        char num[16];
+        itoa(d, num);
+
+        line[0] = '\0';
+        fetch_append_cap(line, "USB usb", FETCH_LINE_MAX);
+        fetch_append_cap(line, num, FETCH_LINE_MAX);
+        fetch_append_cap(line, ":", FETCH_LINE_MAX);
+
+        fetch_disk_count++;
+    }
+}
+
+/* ---------------- uptime (за RTC, з точністю до хвилини) ---------------- */
+static long boot_minutes = -1;
+
+/* кількість днів від 1970-01-01 до заданої дати (алгоритм days_from_civil) */
+static long days_from_civil(int y, int m, int d)
+{
+    if (m <= 2) y--;
+    long era = (y >= 0 ? y : y - 399) / 400;
+    long yoe = y - era * 400;
+    long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static long rtc_minutes_now(void)
+{
+    RTC_TIME t = rtc_get_time();
+    int y = t.year < 100 ? t.year + 2000 : t.year;
+    return days_from_civil(y, t.month, t.day) * 1440L + t.hour * 60L + t.minute;
+}
+
+void uptime_mark_boot(void)
+{
+    if (boot_minutes < 0)
+        boot_minutes = rtc_minutes_now();
+}
+
+/* "2 days" / "1 hour" — з комою між частинами */
+static void fetch_append_unit(char *dst, long n, const char *one, const char *many, int *first)
+{
+    if (!*first)
+        fetch_append_cap(dst, ", ", FETCH_LINE_MAX);
+
+    char num[16];
+    itoa((int)n, num);
+    fetch_append_cap(dst, num, FETCH_LINE_MAX);
+    fetch_append_cap(dst, n == 1 ? one : many, FETCH_LINE_MAX);
+    *first = 0;
+}
+
+static void fetch_build_uptime(void)
+{
+    long up = 0;
+    if (boot_minutes >= 0)
+        up = rtc_minutes_now() - boot_minutes;
+    if (up < 0)
+        up = 0;
+
+    long d = up / 1440, h = (up % 1440) / 60, m = up % 60;
+    int first = 1;
+
+    fetch_val_up[0] = '\0';
+    if (d) fetch_append_unit(fetch_val_up, d, " day",  " days",  &first);
+    if (h) fetch_append_unit(fetch_val_up, h, " hour", " hours", &first);
+    if (m || first) fetch_append_unit(fetch_val_up, m, " min", " mins", &first);
+}
 
 static void build_fetch_lines(void)
 {
-    fetch_line_host[0] = '\0';
-    fetch_append(fetch_line_host, "Host    : ");
-    fetch_append(fetch_line_host, (char *)hardware_get_computer_name());
+    fetch_build_uptime();
 
-    fetch_line_cpu[0] = '\0';
-    fetch_append(fetch_line_cpu, "CPU     : ");
-    fetch_append(fetch_line_cpu, (char *)hardware_get_cpu_brand());
-    fetch_append(fetch_line_cpu, " (");
-    fetch_append_int(fetch_line_cpu, hardware_get_logical_cpus());
-    fetch_append(fetch_line_cpu, "C)");
+    fetch_val_host[0] = '\0';
+    fetch_append(fetch_val_host, (char *)hardware_get_computer_name());
 
-    fetch_line_mem[0] = '\0';
-    fetch_append(fetch_line_mem, "Memory  : ");
-    fetch_append_int(fetch_line_mem, (int)(hardware_get_ram_bytes() / (1024 * 1024)));
-    fetch_append(fetch_line_mem, " MB");
+    fetch_val_cpu[0] = '\0';
+    fetch_append(fetch_val_cpu, (char *)hardware_get_cpu_brand());
+    fetch_append(fetch_val_cpu, " (");
+    fetch_append_int(fetch_val_cpu, hardware_get_logical_cpus());
+    fetch_append(fetch_val_cpu, "C)");
 
-    fetch_line_res[0] = '\0';
-    fetch_append(fetch_line_res, "Display : ");
-    fetch_append_int(fetch_line_res, (int)framebuffer_width);
-    fetch_append(fetch_line_res, "x");
-    fetch_append_int(fetch_line_res, (int)framebuffer_height);
+    fetch_val_mem[0] = '\0';
+    {
+        int usable_mb    = (int)(hardware_get_ram_bytes() / (1024 * 1024));
+        int installed_mb = (int)(hardware_get_ram_installed_bytes() / (1024 * 1024));
+
+        if (installed_mb > usable_mb)
+        {
+            /* "4096 MB (3843 MB usable)" — скільки стоїть фізично і скільки реально доступно */
+            fetch_append_int(fetch_val_mem, installed_mb);
+            fetch_append(fetch_val_mem, " MB (");
+            fetch_append_int(fetch_val_mem, usable_mb);
+            fetch_append(fetch_val_mem, " MB usable)");
+        }
+        else
+        {
+            fetch_append_int(fetch_val_mem, usable_mb);
+            fetch_append(fetch_val_mem, " MB");
+        }
+    }
+
+    fetch_val_res[0] = '\0';
+    fetch_append_int(fetch_val_res, (int)framebuffer_width);
+    fetch_append(fetch_val_res, "x");
+    fetch_append_int(fetch_val_res, (int)framebuffer_height);
+
+    fetch_collect_disks();
+}
+
+static int fetch_info_rows(void)
+{
+    /* user@host, ----, поля, диски, порожній рядок, 2 рядки палітри */
+    return 2 + FETCH_FIELDS + fetch_disk_count + 3;
+}
+
+/* Правий стовпчик: рядок i (без переведення рядка в кінці) */
+static void fetch_print_info(int i)
+{
+    int disks_end = 2 + FETCH_FIELDS + fetch_disk_count;
+
+    if (i == 0)
+    {
+        shell_print_color(FETCH_USER, FETCH_LABEL);
+        shell_print_color("@", FETCH_WHITE);
+        shell_print_color(FETCH_HOST, FETCH_LABEL);
+    }
+    else if (i == 1)
+    {
+        char dashes[40];
+        int n = fetch_strlen(FETCH_USER) + 1 + fetch_strlen(FETCH_HOST);
+        if (n > (int)sizeof dashes - 1) n = (int)sizeof dashes - 1;
+        for (int k = 0; k < n; k++) dashes[k] = '-';
+        dashes[n] = '\0';
+        shell_print_color(dashes, FETCH_WHITE);
+    }
+    else if (i < 2 + FETCH_FIELDS)
+    {
+        int f = i - 2;
+        shell_print_color((char *)fetch_labels[f], FETCH_LABEL);
+        shell_print_color(": ", FETCH_WHITE);
+        shell_print_color((char *)fetch_values[f], FETCH_WHITE);
+    }
+    else if (i < disks_end)
+    {
+        shell_print_color("Disk", FETCH_LABEL);
+        shell_print_color(": ", FETCH_WHITE);
+        shell_print_color(fetch_disk[i - 2 - FETCH_FIELDS], FETCH_WHITE);
+    }
+    else if (i == disks_end + 1 || i == disks_end + 2)
+    {
+        int row = i - (disks_end + 1);          /* 0 — темні, 1 — яскраві */
+        for (int k = 0; k < 8; k++)
+            shell_print_color(FETCH_BLOCK, fetch_palette[row * 8 + k]);
+    }
+    /* disks_end — порожній рядок між полями й палітрою */
 }
 
 void print_fetch(void)
 {
     build_fetch_lines();
 
-    const char *info[] = {
-        "  MerdenOS  ",
-        "--------------",
-        "Kernel  : Rose",
-        "Arch    : i686",
-        fetch_line_host,
-        fetch_line_cpu,
-        fetch_line_mem,
-        fetch_line_res,
-        "Shell   : merden-sh",
-    };
-    int info_count = sizeof(info) / sizeof(info[0]);
-
+    int info_rows = fetch_info_rows();
     int rows = (int)LOGO_LINES;
-    if (info_count > rows)
-        rows = info_count;
+    if (info_rows > rows)
+        rows = info_rows;
 
     shell_print("\n");
 
     for (int i = 0; i < rows; i++)
     {
-        const char *left  = (i < (int)LOGO_LINES) ? logo_lines[i] : "";
-        const char *right = (i < info_count) ? info[i] : "";
+        fetch_print_logo_line(i < (int)LOGO_LINES ? logo_lines[i] : "");
 
-        char row[160];
-        fetch_row(row, left, right);
-        fetch_append(row, "\n");
-        shell_print(row);
+        if (i < info_rows)
+            fetch_print_info(i);
+
+        shell_print("\n");
     }
 
     shell_print("\n");
@@ -706,6 +929,7 @@ void shell_editor_start(const char *filename)
 
             if (ch == '\n')
             {
+                shell_print("\n");   // перехід на новий рядок перед номером
                 editor_line_number++;
                 itoa(editor_line_number, num_prefix);
                 shell_print(num_prefix);
@@ -817,6 +1041,7 @@ void shell_redraw_line(const char *buf, int length, int new_cursor_pos)
 
     show_cursor();
 }
+
 void shell_cursor_left(void)
 {
     if (editor_mode) return;
@@ -911,8 +1136,41 @@ void power_off(void)
         asm volatile("hlt");
 }
 
+static char savelog_buf[24576];
+static uint32_t savelog_len; 
+
+static void savelog_sink(int level, const char *line)
+{
+    (void)level;
+    while(*line && savelog_len < sizeof savelog_buf - 2) savelog_buf[savelog_len++] = *line++;
+    savelog_buf[savelog_len++] = '\n';
+}
+
+static void cmd_savelog(void)
+{
+    savelog_len = 0;
+    klog_dump(savelog_sink);
+    if (usbfs_drive_count() == 0) (usbfs_rescan());
+    if (usbfs_drive_count() == 0) { shell_print("savelog: no USB flash drive mounted (FAT32)\n"); return; }
+
+    int saved = 0;
+    for (int i = 0; i < usbfs_drive_count(); i++) {
+        int d = usbfs_drive_at(i, 0, 0);
+        if (d < 0) continue;
+        char path[24] = "usb0:/merden.log";
+        path[3] = (char)('0' + d);
+        int rc = usbfs_write(path, savelog_buf, savelog_len);
+        if (rc == 0) { shell_print("saved "); shell_print(path); shell_print("\n"); saved++; }
+        else { shell_print("savelog: "); shell_print(path); shell_print(": "); shell_print((char *)usbfs_strerror(rc)); shell_print("\n"); }
+    }
+    if (!saved) shell_print("savelog: could not write to any drive\n");
+}
+
 void shell_execute_command(char* command)
 {
+    if (usbfs_command(command))
+        return;
+
     if ((strcmp(command, "help") == 0) || (strcmp(command, "help ") == 0))
     {
         shell_print("Avaible commands:\n");
@@ -934,6 +1192,7 @@ void shell_execute_command(char* command)
         shell_print("> mouse:            -    test USB mouse (ESC to stop)\n");
         shell_print("> IDE_debug:        -    Debug IDE device\n");
         shell_print("> run<filename.mrd> -    run merden-file\n");
+        shell_print("> usb help          -    USB flash (FAT32/exFAT): usb0: switches drive, then ls/cat/write/rm/mkdir/mv/cp/edit\n");
     }
     else if ((strcmp(command, "clear") == 0) || (strcmp(command, "clear ") == 0))
     {
@@ -942,7 +1201,6 @@ void shell_execute_command(char* command)
         shell_col = 0;
         shell_row = 1;
         draw_top_panel();
-        //show_cursor();
     }
     else if ((strcmp(command, "cls") == 0)   || (strcmp(command, "cls ") == 0))
     {
@@ -951,7 +1209,6 @@ void shell_execute_command(char* command)
         shell_col = 0;
         shell_row = 1;
         draw_top_panel();
-        //show_cursor()
     }
     else if ((strcmp(command, "about") == 0) || (strcmp(command, "about ") == 0))
     {
@@ -976,13 +1233,6 @@ void shell_execute_command(char* command)
     {
         shell_print("Memory: basic/RMM draft\n");
     }
-    /*
-    else if ((strcmp(command, "touch grass")) || (strcmp(command, "touch grass ") == 0))
-    {
-        shell_print("YOU CANT\n");
-    }
-    */
-    
     else if((strcmp(command, "time") == 0) || (strcmp(command, "time ") == 0))
     {
         RTC_TIME time = rtc_get_time();
@@ -1003,6 +1253,16 @@ void shell_execute_command(char* command)
         shell_print_int(time.minute);
         shell_print("\n");
 
+    }
+    else if (strcmp(command, "dmesg") == 0)
+    { 
+        klog_dmesg(); 
+        return; 
+    }
+    else if (strcmp(command, "savelog") == 0) 
+    { 
+        cmd_savelog(); 
+        return; 
     }
     else if ((strcmp(command, "date") == 0 ) || (strcmp(command, "date ") == 0))
     {
@@ -1039,13 +1299,17 @@ void shell_execute_command(char* command)
     }
     else if((strncmp(command, "calc ", 5) == 0))
     {
-        shell_print("Usage: calculator <number> <+|-|*|/> <number>\n");
-
         shell_calculator(command);
     }
     else if((strcmp(command, "fastfetch ") == 0) || (strcmp(command, "fastfetch") == 0))
     {
         print_fetch();
+    }
+    else if (strcmp(command, "gui") == 0)
+    {
+        cmd_gui();
+        shell_execute_command("cls");
+    
     }
     else if ((strcmp(command, "list") == 0) || (strcmp(command, "list ") == 0))
     {
@@ -1074,14 +1338,18 @@ void shell_execute_command(char* command)
 
         if(data) 
         {
-            shell_print((char *)data);
+            shell_print_utf8(data);
             shell_print("\n");
+        }
+        else
+        {
+            shell_print("File not found\n");
         }
     }
     else if ((strcmp(command, "mouse") == 0) || (strcmp(command, "mouse ") == 0))
-        {
-            cmd_mouse_test();
-        }
+    {
+        cmd_mouse_test();
+    }
     else if (strncmp(command, "create ", 7) == 0)
     {
         const char *file_name = command + 7;
@@ -1095,34 +1363,10 @@ void shell_execute_command(char* command)
             shell_print("Failed to complete! :(\n");
         }
     }
-    else if ((strcmp(command, "doge") == 0) || (strcmp(command, "doge ") == 0))
-{
-    if (bmp_draw_fullscreen(doge_data, doge_size) != 0)
-    {
-        shell_print("Failed to draw image\n");
-    }
-    else
-    {
-        // Чекаємо ESC (scancode 0x01), ігноруючи решту клавіш 
-        for (;;)
-        {
-            if (inb(0x64) & 1)
-            {
-                unsigned char scancode = inb(0x60);
-                if (scancode == 0x01)
-                {
-                    break;
-                }
-            }
-        }
-
-        shell_execute_command("cls");
-        //shell_prompt();
-    }   
-}
     else if (strncmp(command, "edit ", 5) == 0)
     {
-        shell_editor_start(command + 5);
+        char eb[300];
+        shell_editor_start((char *)usbfs_edit_path(command + 5, eb, sizeof eb));
     }
     else if(strcmp(command, "hardware") == 0)
     {
@@ -1140,31 +1384,26 @@ void shell_execute_command(char* command)
     }
     else if(strcmp(command, "IDE_debug") == 0)
     {
-        int found = 0;
         int count = 0;
-        
+        for (int i = 0; i < 4; i++)
+            if (ide_devices[i].Reserved)
+                count++;
+
         if (count == 0)
         {
             t_printf("IDE: no drives found\n");
             return;
         }
 
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < 4; i++)
         {
+            if (!ide_devices[i].Reserved)
+                continue;
+
             t_printf("Found %s Drive %dGB - %s\n",
                 (const char *[]){"ATA", "ATAPI"}[ide_devices[i].Type],
                 ide_devices[i].Size / 1024 / 1024 / 2,
                 ide_devices[i].Model);
-        }
-
-        int target_drive = -1;
-        for (int i = 0; i < 4; i++)
-        {
-            if (ide_devices[i].Reserved && ide_devices[i].Type == IDE_ATA)
-            {
-                target_drive = i;
-                break;
-            }
         }
     }
     else if (command[0] == 'e' &&
@@ -1172,7 +1411,7 @@ void shell_execute_command(char* command)
         command[2] == 'h' &&
         command[3] == 'o' &&
         command[4] == ' ') {
-        shell_print(command + 5);
+        shell_print_utf8(command + 5);
         shell_print("\n");
     }
     else if (command[0] == '\0') {
@@ -1194,6 +1433,7 @@ void shell_restart(void)
     hide_cursor();
 
     command_index = 0;
+    shell_cursor_pos = 0;
     command_buffer[0] = '\0';
 
     shell_print("^C\n");

@@ -22,10 +22,12 @@ class TokenKind(Enum):
     STRING = auto()
 
     REMEMBER = auto()
+    SET = auto()
     SAY = auto()
     WHEN = auto()
     OTHERWISE = auto()
     REPEAT = auto()
+    IMPORT = auto()
     TRUE = auto()
     FALSE = auto()
 
@@ -48,12 +50,14 @@ class TokenKind(Enum):
 
 KEYWORDS = {
     "remember": TokenKind.REMEMBER,
+    "set": TokenKind.SET,
     "say": TokenKind.SAY,
     "when": TokenKind.WHEN,
     "otherwise": TokenKind.OTHERWISE,
     "repeat": TokenKind.REPEAT,
     "true": TokenKind.TRUE,
     "false": TokenKind.FALSE,
+    "import": TokenKind.IMPORT,
 }
 
 @dataclass
@@ -72,6 +76,10 @@ class MerdenError(Exception):
         self.message = message
         self.line = line
         self.column = column
+        # Filled in when the error comes from an imported module,
+        # so the report points at the right file and source line.
+        self.source: str | None = None
+        self.filename: str | None = None
 
 class Lexer:
     def __init__(self, source: str):
@@ -238,6 +246,15 @@ class RememberStatement(Statement):
     value: Expression
 
 @dataclass
+class SetStatement(Statement):
+    name: str
+    value: Expression
+
+@dataclass
+class ImportStatement(Statement):
+    path: str
+
+@dataclass
 class SayStatement(Statement):
     value: Expression
 
@@ -288,6 +305,7 @@ class Parser:
     def __init__(self, tokens: Sequence[Token]):
         self.tokens = tokens
         self.current = 0
+        self.depth = 0  # how many blocks we are inside; 0 means top level
 
     def parse(self) -> Program:
         statements: list[Statement] = []
@@ -305,6 +323,23 @@ class Parser:
             self._consume(TokenKind.EQUAL, "The '=' sign is expected after the variable name")
             value = self._expression()
             return RememberStatement(keyword.line, keyword.column, str(name.value), value)
+
+        if self._match(TokenKind.SET):
+            keyword = self._previous()
+            name = self._consume(TokenKind.IDENTIFIER, "A variable name is expected after 'set'")
+            self._consume(TokenKind.EQUAL, "The '=' sign is expected after the variable name")
+            value = self._expression()
+            return SetStatement(keyword.line, keyword.column, str(name.value), value)
+
+        if self._match(TokenKind.IMPORT):
+            keyword = self._previous()
+            if self.depth > 0:
+                raise MerdenError("'import' is only allowed at the top level", keyword.line, keyword.column)
+            path = self._consume(
+                TokenKind.STRING,
+                "A module path in quotation marks is expected after 'import'"
+            )
+            return ImportStatement(keyword.line, keyword.column, str(path.value))
 
         if self._match(TokenKind.SAY):
             keyword = self._previous()
@@ -331,10 +366,15 @@ class Parser:
             return RepeatStatement(keyword.line, keyword.column, count, body)
 
         token = self._peek()
-        raise MerdenError("Expected a remember, say, when, or repeat command", token.line, token.column)
+        raise MerdenError(
+            "Expected a remember, set, say, when, repeat, or import command",
+            token.line,
+            token.column,
+        )
 
     def _block(self, message: str) -> list[Statement]:
         self._consume(TokenKind.LEFT_BRACE, message)
+        self.depth += 1
         body: list[Statement] = []
         self._skip_newlines()
         while not self._check(TokenKind.RIGHT_BRACE) and not self._check(TokenKind.EOF):
@@ -342,6 +382,7 @@ class Parser:
             self._consume_statement_end()
             self._skip_newlines()
         self._consume(TokenKind.RIGHT_BRACE, "Code block is not closed with '}'")
+        self.depth -= 1
         return body
 
     def _expression(self) -> Expression:
@@ -485,6 +526,17 @@ class CGenerator:
         return "\n".join(self.lines) + "\n"
 
     def _statement(self, statement: Statement) -> None:
+        try:
+            self._statement_inner(statement)
+        except MerdenError as error:
+            # Statements that came from an imported module remember where
+            # they were written, so the error points at the right file.
+            origin = getattr(statement, "origin", None)
+            if error.filename is None and origin is not None:
+                error.source, error.filename = origin
+            raise
+
+    def _statement_inner(self, statement: Statement) -> None:
         if isinstance(statement, RememberStatement):
             if statement.name in self.scopes[-1]:
                 raise MerdenError(f"Variable '{statement.name}' already exists in this block", statement.line, statement.column)
@@ -499,6 +551,22 @@ class CGenerator:
             }[value_type]
             self._emit(f"{c_type} {c_name} = {expression};")
             return
+
+        if isinstance(statement, SetStatement):
+            symbol = self._find_symbol(statement.name, statement.line, statement.column)
+            expression, value_type = self._expression(statement.value)
+            if value_type is not symbol.value_type:
+                raise MerdenError(
+                    f"Variable '{statement.name}' holds a {symbol.value_type.name.lower()}, "
+                    f"but the new value is a {value_type.name.lower()}",
+                    statement.line,
+                    statement.column,
+                )
+            self._emit(f"{symbol.c_name} = {expression};")
+            return
+
+        if isinstance(statement, ImportStatement):
+            raise MerdenError("Internal error: 'import' was not expanded", statement.line, statement.column)
 
         if isinstance(statement, SayStatement):
             self._say(statement)
@@ -648,10 +716,91 @@ class CGenerator:
     @classmethod
     def _escape_printf(cls, value: str) -> str:
         return cls._escape_c_string(value).replace("%", "%%")
-    
-def compile_source(source: str) -> tuple[list[Token], Program, str]:
+
+
+def _tag_origin(statements: list[Statement], origin: tuple[str, str]) -> None:
+    """Remember which (source, filename) each statement was parsed from."""
+    for statement in statements:
+        statement.origin = origin  # type: ignore[attr-defined]
+        if isinstance(statement, WhenStatement):
+            _tag_origin(statement.then_branch, origin)
+            if statement.otherwise_branch is not None:
+                _tag_origin(statement.otherwise_branch, origin)
+        elif isinstance(statement, RepeatStatement):
+            _tag_origin(statement.body, origin)
+
+
+def _expand_imports(
+    program: Program,
+    file_path: Path,
+    source: str,
+    stack: list[Path],
+    loaded: set[Path],
+) -> list[Statement]:
+    """Replace every top-level 'import' with the statements of that module.
+
+    stack  - files currently being expanded (used to detect cycles)
+    loaded - files already included once (each module is included only once)
+    """
+    result: list[Statement] = []
+
+    def import_error(message: str, statement: Statement) -> MerdenError:
+        error = MerdenError(message, statement.line, statement.column)
+        error.source = source
+        error.filename = str(file_path)
+        return error
+
+    for statement in program.statements:
+        if not isinstance(statement, ImportStatement):
+            result.append(statement)
+            continue
+
+        module_path = (file_path.parent / statement.path).resolve()
+
+        if module_path in stack:
+            chain = " -> ".join(p.name for p in stack + [module_path])
+            raise import_error(f"Circular module import: {chain}", statement)
+
+        if module_path in loaded:
+            continue
+
+        if not module_path.exists():
+            raise import_error(f"Module not found: {statement.path}", statement)
+        if module_path.suffix != ".mrd":
+            raise import_error("A module file must have the .mrd extension", statement)
+
+        module_source = module_path.read_text(encoding="utf-8")
+        try:
+            module_program = Parser(Lexer(module_source).tokenize()).parse()
+        except MerdenError as error:
+            if error.filename is None:
+                error.source = module_source
+                error.filename = str(module_path)
+            raise
+
+        loaded.add(module_path)
+        stack.append(module_path)
+        module_statements = _expand_imports(module_program, module_path, module_source, stack, loaded)
+        stack.pop()
+
+        _tag_origin(module_statements, (module_source, str(module_path)))
+        result.extend(module_statements)
+
+    return result
+
+
+def compile_source(
+    source: str,
+    source_path: Path | None = None
+) -> tuple[list[Token], Program, str]:
     tokens = Lexer(source).tokenize()
     program = Parser(tokens).parse()
+
+    if source_path is not None:
+        root = source_path.resolve()
+        statements = _expand_imports(program, root, source, [root], {root})
+        program = Program(statements)
+
     c_code = CGenerator().generate(program)
     return tokens, program, c_code
 
@@ -697,6 +846,10 @@ def build_native(source_path: Path, c_code: str) -> tuple[Path, Path, list[str]]
 
 
 def format_error(error: MerdenError, source: str, filename: str) -> str:
+    # Errors from imported modules carry their own source and file name.
+    if error.filename is not None:
+        filename = error.filename
+        source = error.source or ""
     lines = source.splitlines()
     source_line = lines[error.line - 1] if 0 < error.line <= len(lines) else ""
     caret = " " * max(error.column - 1, 0) + "^"
@@ -745,7 +898,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     source = ""
     try:
         source = read_source(args.file)
-        tokens, program, c_code = compile_source(source)
+        tokens, program, c_code = compile_source(
+            source,
+            args.file.resolve()
+        )
 
         if args.command == "tokens":
             for token in tokens:

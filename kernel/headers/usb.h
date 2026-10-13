@@ -36,8 +36,8 @@ typedef struct {
     uint8_t  bInterval;
 } __attribute__((packed)) usb_endpoint_descriptor_t;
 
-#define USB_REQ_GET_DESCRIPTOR   0x06
-#define USB_REQ_SET_ADDRESS      0x05
+#define USB_REQ_GET_DESCRIPTOR    0x06
+#define USB_REQ_SET_ADDRESS       0x05
 #define USB_REQ_SET_CONFIGURATION 0x09
 #define USB_DESC_DEVICE  0x01
 #define USB_DESC_CONFIG  0x02
@@ -51,6 +51,8 @@ int usb_control_transfer(uhci_controller_t *hc, usb_device_t *dev,
                           uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                           void *data, int dev_to_host);
 
+int usb_get_descriptor(uhci_controller_t *hc, usb_device_t *dev,
+                       uint8_t type, uint8_t index, uint16_t len, void *out);
 int usb_get_device_descriptor(uhci_controller_t *hc, usb_device_t *dev, usb_device_descriptor_t *out);
 int usb_set_address(uhci_controller_t *hc, usb_device_t *dev, uint8_t new_addr);
 int usb_set_configuration(uhci_controller_t *hc, usb_device_t *dev, uint8_t config_value);

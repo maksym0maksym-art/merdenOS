@@ -6,6 +6,7 @@
 #include "../../../system/shell/graphic/console.h"
 #include "../../../standarts_lib/stdio.h"
 #include "io.h"
+#include "../../headers/mouse.h"
 
 #define LEFT_SHIFT_PRESS 0x2A
 #define LEFT_SHIFT_RELEASE 0xAA
@@ -191,7 +192,17 @@ void keyboard_handler()
 	static int capslock_enabled = false;
     static int left_ctrl_pressed = false;
 
-		if(inb(0x64) & 1) 
+		unsigned char kbd_status = inb(0x64);
+
+		/* Клавіатура й PS/2-мишка ділять один вихідний буфер. Біт 0x20 = байт від мишки:
+		 * віддаємо його драйверу мишки, інакше він вважався б скан-кодом клавіші. */
+		if ((kbd_status & 0x21) == 0x21)
+		{
+			ps2_mouse_feed(inb(0x60));
+			return;
+		}
+
+		if(kbd_status & 1) 
 		{
 			unsigned char scancode = inb(0x60);
 

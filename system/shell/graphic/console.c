@@ -15,8 +15,25 @@ extern void draw_top_panel(void);
 #define CELL_COLOR(cell)     ((cell) & 0xFFFFFF)
 #define BLANK_CELL           MAKE_CELL(' ', COLOR_WHITE)
 
-static uint32_t hist[HISTORY_ROWS][SCREEN_COLS];   // історія шела
-static uint32_t alt_buf[SCREEN_ROW][SCREEN_COLS];  // "чужий" екран (редактор)
+static uint32_t hist[HISTORY_ROWS][MAX_COLS];
+static uint32_t alt_buf[MAX_ROWS][MAX_COLS];
+
+int console_cols = 128;
+int console_rows = 41;
+
+void console_init_geometry(void)
+{
+    int cols = (int)(framebuffer_width  / CHAR_WIDTH);
+    int rows = (int)(framebuffer_height / CHAR_HEIGHT) - 1;
+
+    if (cols > MAX_COLS) cols = MAX_COLS;
+    if (rows > MAX_ROWS) rows = MAX_ROWS;
+    if (cols < 40)       cols = 40;
+    if (rows < TOP_ROWS + 2) rows = TOP_ROWS + 2;
+
+    console_cols = cols;
+    console_rows = rows;
+}
 
 static int live_top    = 0;
 static int view_offset = 0;
@@ -244,8 +261,14 @@ static void con_putc(char c, uint32_t color)
     }
 }
 
+static console_sink_fn sink_fn;
+void console_set_sink(console_sink_fn fn) { sink_fn = fn; }
+
 void console_puts_color(const char *s, uint32_t color)
 {
+
+    if (sink_fn) { while (*s) sink_fn(*s++, color); return; }
+
     if (!alt_active)
         console_snap_to_bottom();   // новий вивід шела завжди повертає до кінця
 
@@ -257,6 +280,8 @@ void console_puts_color(const char *s, uint32_t color)
 
 void console_putc(char c)
 {
+    if (sink_fn) { sink_fn(c, COLOR_WHITE); return; }
+    
     if (!alt_active)
         console_snap_to_bottom();
 

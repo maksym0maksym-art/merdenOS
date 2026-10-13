@@ -1,4 +1,5 @@
 #include "../../headers/hardware.h"
+#include "../../headers/framebuffer.h"   /* framebuffer_* — один спільний набір змінних, а не своя копія */
 
 #include "../../../system/shell/shell.h"
 
@@ -142,11 +143,10 @@ static void detect_cpu(void)
             &edx
         );
 
-        cpu_logical_cpus =
-            (ebx >> 16) & 0xFF;
-
-        if (cpu_logical_cpus == 0)
-            cpu_logical_cpus = 1;
+        /* EBX[23:16] — це МАКСИМУМ логічних ID в пакеті, а не реальна кількість
+           ядер (на i3 з 2C/4T тут буде 16). Реальну кількість рахуємо з ACPI MADT
+           (detect_cpu_count), а це — лише запасне значення. */
+        cpu_logical_cpus = 1;
     }
 }
 
@@ -240,10 +240,7 @@ static void detect_ram(uint32_t address)
    FrameBuffer
 =======================*/
 
-static uint32_t framebuffer_width = 0;
-static uint32_t framebuffer_height = 0;
-static uint32_t framebuffer_pitch = 0;
-static uint8_t framebuffer_bpp = 0;
+/* framebuffer_width/height/pitch/bpp беруться з framebuffer.h (ставить frambuffer.c) */
 
 
 #define MULTIBOOT2_TAG_TYPE_FRAMEBUFFER 8
@@ -285,17 +282,7 @@ static void detect_framebuffer(uint32_t address)
                 (struct multiboot_tag_framebuffer *)tag;
 
 
-            framebuffer_width =
-                fb->framebuffer_width;
-
-            framebuffer_height =
-                fb->framebuffer_height;
-
-            framebuffer_pitch =
-                fb->framebuffer_pitch;
-
-            framebuffer_bpp =
-                fb->framebuffer_bpp;
+            (void)fb;                   /* дані вже в frambuffer.c */
 
             return;
         }
@@ -355,30 +342,57 @@ static const char *smbios_string(struct smbios_header *hdr, uint8_t index)
 }
 
 
-static void detect_computer_name(void)
-{
-    uint8_t *p = (uint8_t *)0xF0000;
-    uint8_t *scan_end = (uint8_t *)0xFFFF0;
-    uint8_t *anchor = 0;
+/* Реальний встановлений обсяг RAM = сума розмірів усіх планок із SMBIOS (тип 17,
+   "Memory Device"). Це те, що фізично стоїть у слотах, а не "usable" з мапи пам'яті
+   (яка не враховує діри під PCI, пам'ять під вбудоване відео тощо). */
+static uint32_t smbios_ram_mb = 0;
 
-    while (p < scan_end)
+static void ram_from_table(uint8_t *table, uint32_t table_len)
+{
+    uint8_t *table_end = table + table_len;
+    uint32_t total = 0;
+
+    while (table + sizeof(struct smbios_header) <= table_end)
     {
-        if (p[0] == '_' && p[1] == 'S' && p[2] == 'M' && p[3] == '_')
-        {
-            anchor = p;
+        struct smbios_header *hdr = (struct smbios_header *)table;
+
+        if (hdr->length < sizeof(struct smbios_header))
             break;
+
+        if (hdr->type == 17 && hdr->length >= 0x0E)   // Memory Device (одна планка)
+        {
+            uint16_t size = *(uint16_t *)(table + 0x0C);
+            uint32_t mb = 0;
+
+            if (size == 0x7FFF && hdr->length >= 0x20)
+                mb = *(uint32_t *)(table + 0x1C) & 0x7FFFFFFF;   // розширений розмір, МБ
+            else if (size == 0 || size == 0xFFFF)
+                mb = 0;                                           // слот порожній / невідомо
+            else if (size & 0x8000)
+                mb = (size & 0x7FFF) / 1024;                      // розмір у КБ
+            else
+                mb = size;                                        // розмір у МБ
+
+            total += mb;
         }
 
-        p += 16;
+        if (hdr->type == 127)   // End-of-table
+            break;
+
+        uint8_t *strs = table + hdr->length;
+
+        while (strs + 1 < table_end && !(strs[0] == 0 && strs[1] == 0))
+            strs++;
+
+        table = strs + 2;
     }
 
-    if (!anchor)
-        return;   // SMBIOS не знайдено, лишаємо "Unknown Computer"
+    smbios_ram_mb = total;   // присвоєння, а не +=, щоб повторний виклик не подвоював суму
+}
 
-    uint32_t table_addr = *(uint32_t *)(anchor + 0x18);
-    uint16_t table_len  = *(uint16_t *)(anchor + 0x16);
 
-    uint8_t *table = (uint8_t *)table_addr;
+static int name_from_table(uint8_t *table, uint32_t table_len)
+{
     uint8_t *table_end = table + table_len;
 
     while (table + sizeof(struct smbios_header) <= table_end)
@@ -388,12 +402,9 @@ static void detect_computer_name(void)
         if (hdr->length < sizeof(struct smbios_header))
             break;   // пошкоджена таблиця — краще зупинитись
 
-        if (hdr->type == 1)   // System Information
+        if (hdr->type == 1 && hdr->length > 5)   // System Information
         {
-            uint8_t product_index = table[5];   // офсет 5 = Product Name
-
-            const char *name = smbios_string(hdr, product_index);
-
+            const char *name = smbios_string(hdr, table[5]);   // офсет 5 = Product Name
             int i = 0;
 
             while (name[i] && i < (int)sizeof(computer_name) - 1)
@@ -404,7 +415,7 @@ static void detect_computer_name(void)
 
             computer_name[i] = '\0';
 
-            return;
+            return i > 0;
         }
 
         if (hdr->type == 127)   // End-of-table
@@ -412,10 +423,235 @@ static void detect_computer_name(void)
 
         uint8_t *strs = table + hdr->length;
 
-        while (!(strs[0] == 0 && strs[1] == 0))
+        while (strs + 1 < table_end && !(strs[0] == 0 && strs[1] == 0))
             strs++;
 
         table = strs + 2;
+    }
+
+    return 0;
+}
+
+
+static int try_smbios_anchor(uint8_t *anchor)
+{
+    if (anchor[0] == '_' && anchor[1] == 'S' && anchor[2] == 'M' && anchor[3] == '3' && anchor[4] == '_')
+    {
+        /* SMBIOS 3.0: максимальний розмір таблиці @0x0C, 64-бітна адреса @0x10 */
+        uint32_t len = *(uint32_t *)(anchor + 0x0C);
+        uint32_t lo  = *(uint32_t *)(anchor + 0x10);
+        uint32_t hi  = *(uint32_t *)(anchor + 0x14);
+
+        if (hi != 0 || lo == 0)
+            return 0;   // таблиця вище 4 ГБ — 32-бітне ядро її не бачить
+
+        ram_from_table((uint8_t *)lo, len);
+        return name_from_table((uint8_t *)lo, len);
+    }
+
+    if (anchor[0] == '_' && anchor[1] == 'S' && anchor[2] == 'M' && anchor[3] == '_')
+    {
+        uint32_t table_addr = *(uint32_t *)(anchor + 0x18);
+        uint16_t table_len  = *(uint16_t *)(anchor + 0x16);
+
+        if (table_addr == 0)
+            return 0;
+
+        ram_from_table((uint8_t *)table_addr, table_len);
+        return name_from_table((uint8_t *)table_addr, table_len);
+    }
+
+    return 0;
+}
+
+
+static int guid_eq(const uint8_t *a, const uint8_t *b)
+{
+    for (int i = 0; i < 16; i++)
+        if (a[i] != b[i])
+            return 0;
+
+    return 1;
+}
+
+
+static struct multiboot_tag *find_mb_tag(uint32_t address, uint32_t type)
+{
+    struct multiboot_tag *tag = (struct multiboot_tag *)(address + 8);
+
+    while (tag->type != MULTIBOOT2_TAG_TYPE_END)
+    {
+        if (tag->type == type)
+            return tag;
+
+        tag = (struct multiboot_tag *)(((uint32_t)tag + tag->size + 7) & ~7);
+    }
+
+    return 0;
+}
+
+
+/* На сучасних UEFI-ноутбуках (Vivobook та ін.) таблиці SMBIOS/ACPI НЕ лежать у
+   0xF0000..0xFFFFF — їх адреси є в EFI Configuration Table. GRUB передає
+   вказівник на EFI System Table тегами multiboot2 11 (32-біт) та 12 (64-біт). */
+static int detect_name_efi(uint32_t mbi)
+{
+    static const uint8_t guid_smbios3[16] = { 0x44,0x15,0xfd,0xf2, 0x94,0x97, 0x2c,0x4a, 0x99,0x2e, 0xe5,0xbb,0xcf,0x20,0xe3,0x94 };
+    static const uint8_t guid_smbios2[16] = { 0x31,0x2d,0x9d,0xeb, 0x88,0x2d, 0xd3,0x11, 0x9a,0x16, 0x00,0x90,0x27,0x3f,0xc1,0x4d };
+
+    struct multiboot_tag *t64 = find_mb_tag(mbi, 12);
+    struct multiboot_tag *t32 = find_mb_tag(mbi, 11);
+    uint8_t *cfg = 0;
+    uint32_t count = 0, esz = 0, vend_off = 16;
+
+    if (t64)
+    {
+        uint32_t lo = ((uint32_t *)t64)[2], hi = ((uint32_t *)t64)[3];
+
+        if (hi != 0 || lo == 0)
+            return 0;
+
+        uint8_t *st = (uint8_t *)lo;
+
+        count = *(uint32_t *)(st + 0x68);
+        uint32_t cl = *(uint32_t *)(st + 0x70), ch = *(uint32_t *)(st + 0x74);
+
+        if (ch != 0)
+            return 0;
+
+        cfg = (uint8_t *)cl;
+        esz = 24;
+    }
+    else if (t32)
+    {
+        uint8_t *st = (uint8_t *)((uint32_t *)t32)[2];
+
+        if (!st)
+            return 0;
+
+        count = *(uint32_t *)(st + 64);
+        cfg = (uint8_t *)*(uint32_t *)(st + 68);
+        esz = 20;
+    }
+    else
+        return 0;
+
+    if (!cfg || count > 256)
+        return 0;
+
+    for (int pass = 0; pass < 2; pass++)   // спочатку SMBIOS 3, потім 2
+    {
+        const uint8_t *want = pass == 0 ? guid_smbios3 : guid_smbios2;
+
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint8_t *e = cfg + i * esz;
+
+            if (!guid_eq(e, want))
+                continue;
+
+            uint32_t lo = *(uint32_t *)(e + vend_off);
+            uint32_t hi = esz == 24 ? *(uint32_t *)(e + vend_off + 4) : 0;
+
+            if (hi == 0 && lo != 0 && try_smbios_anchor((uint8_t *)lo))
+                return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static void detect_computer_name(uint32_t mbi)
+{
+    if (detect_name_efi(mbi))
+        return;
+
+    /* BIOS/CSM: анкор лежить у 0xF0000..0xFFFFF, вирівняний на 16 байт */
+    for (uint8_t *p = (uint8_t *)0xF0000; p < (uint8_t *)0xFFFF0; p += 16)
+        if (p[0] == '_' && p[1] == 'S' && p[2] == 'M' && try_smbios_anchor(p))
+            return;
+}
+
+
+/* ==========================
+   Кількість логічних CPU (ACPI MADT)
+========================== */
+
+struct acpi_sdt { char sig[4]; uint32_t length; uint8_t rev, csum; char oem[6]; char oemt[8]; uint32_t oemrev, cid, crev; } __attribute__((packed));
+
+static int sig4(const char *a, const char *b)
+{
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static int sum_ok(const uint8_t *p, uint32_t n)
+{
+    uint8_t s = 0;
+
+    while (n--)
+        s += *p++;
+
+    return s == 0;
+}
+
+static void detect_cpu_count(uint32_t mbi)
+{
+    uint8_t *rsdp = 0;
+    struct multiboot_tag *t = find_mb_tag(mbi, 15);
+
+    if (!t)
+        t = find_mb_tag(mbi, 14);
+
+    if (t)
+        rsdp = (uint8_t *)t + 8;
+    else
+        for (uint8_t *p = (uint8_t *)0xE0000; p < (uint8_t *)0x100000; p += 16)
+            if (p[0]=='R' && p[1]=='S' && p[2]=='D' && p[3]==' ' && p[4]=='P' && p[5]=='T' && p[6]=='R' && p[7]==' ' && sum_ok(p, 20))
+            {
+                rsdp = p;
+                break;
+            }
+
+    if (!rsdp)
+        return;
+
+    struct acpi_sdt *rsdt = (struct acpi_sdt *)*(uint32_t *)(rsdp + 16);
+
+    if (!rsdt || rsdt->length < sizeof(struct acpi_sdt) || rsdt->length > 0x10000)
+        return;
+
+    uint32_t n = (rsdt->length - sizeof(struct acpi_sdt)) / 4;
+    uint32_t *ent = (uint32_t *)((uint8_t *)rsdt + sizeof(struct acpi_sdt));
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+        struct acpi_sdt *h = (struct acpi_sdt *)ent[i];
+
+        if (!h || !sig4(h->sig, "APIC") || h->length < 44 || h->length > 0x10000)
+            continue;
+
+        uint8_t *q = (uint8_t *)h + 44, *end = (uint8_t *)h + h->length;
+        int cpus = 0;
+
+        while (q + 2 <= end && q[1] >= 2)
+        {
+            if (q[0] == 0 && q[1] >= 8)                       // Processor Local APIC
+            {
+                if (q[4] & 3) cpus++;                          // enabled | online-capable
+            }
+            else if (q[0] == 9 && q[1] >= 16)                 // Processor Local x2APIC
+            {
+                if (q[8] & 3) cpus++;
+            }
+
+            q += q[1];
+        }
+
+        if (cpus > 0)
+            cpu_logical_cpus = cpus;
+
+        return;
     }
 }
 
@@ -436,7 +672,9 @@ void hardware_init(uint32_t multiboot_info_addr)
         multiboot_info_addr
     );
 
-    detect_computer_name();
+    detect_computer_name(multiboot_info_addr);
+
+    detect_cpu_count(multiboot_info_addr);
 }
 
 
@@ -461,6 +699,15 @@ int hardware_get_logical_cpus(void)
 
 uint64_t hardware_get_ram_bytes(void)
 {
+    return ram_available;
+}
+
+/* Встановлена RAM (сума планок із SMBIOS). Якщо SMBIOS недоступний — usable з мапи пам'яті */
+uint64_t hardware_get_ram_installed_bytes(void)
+{
+    if (smbios_ram_mb > 0)
+        return (uint64_t)smbios_ram_mb * 1024 * 1024;
+
     return ram_available;
 }
 
@@ -502,6 +749,14 @@ void hardware_print_info(void)
     //RAM
 
     shell_print("Memory\n");
+
+    shell_print("  Installed RAM: ");
+
+    shell_print_int(
+        (int)(hardware_get_ram_installed_bytes() / (1024 * 1024))
+    );
+
+    shell_print(" MB\n");
 
     shell_print("  Usable RAM: ");
 

@@ -26,4 +26,9 @@ char *fs_create(const char *name);
 FS_FILE *fs_find(const char *name);
 FS_FILE *fs_get_or_create();
 
+/* для провідника */
+int fs_new_file(const char *name);
+int fs_delete(const char *name);
+int fs_rename_file(const char *from, const char *to);
+
 #endif

@@ -2,6 +2,8 @@ remember name = "Maksm_y"
 
 say "Hello world, {name}"
 
+set name = "Piska"
+
 when name == "Maksm_y"{
     say "Привіт, Макс"
 }

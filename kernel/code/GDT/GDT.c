@@ -47,8 +47,6 @@ create_descriptor(uint32_t base, uint32_t limit, uint16_t flag)
 	descriptor |= base & 0x0000FFFF; 
 
 
-    t_printf("0x%.16llX\n", descriptor);
-
 	return descriptor;
 }
 

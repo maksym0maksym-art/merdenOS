@@ -10,8 +10,12 @@
 #define CHAR_HEIGHT   18
 #endif
 
-#define SCREEN_COLS   128
-#define SCREEN_ROW    26
+#define MAX_COLS      320
+#define MAX_ROWS      120
+extern int console_cols;
+extern int console_rows;
+#define SCREEN_COLS   console_cols
+#define SCREEN_ROW    console_rows
 #define TOP_ROWS      1                         // рядок 0 — верхня панель
 #define VIEW_ROWS     (SCREEN_ROW - TOP_ROWS)   // скільки рядків тексту на екрані
 #define HISTORY_ROWS  1000                      // скільки рядків пам'ятаємо (>= VIEW_ROWS)
@@ -23,9 +27,14 @@ void console_reset(void);                                   // очистити 
 void console_putc(char c);                                  // білий символ
 void console_puts_color(const char *s, uint32_t color);     // рядок заданим кольором
 
+typedef void (*console_sink_fn)(char c, uint32_t color);
+void console_set_sink(console_sink_fn fn);
+
 // --- клітинки "живого" екрана (row = екранний рядок, 0 — панель) ---
 void cell_set(int row, int col, char ch, uint32_t color);
 char cell_get(int row, int col);
+
+void console_init_geometry(void);
 
 // --- гортання історії шела ---
 void console_scroll_view(int delta);

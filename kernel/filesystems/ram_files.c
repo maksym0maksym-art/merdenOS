@@ -181,6 +181,51 @@ FS_FILE *fs_find(const char *name)
 	return 0;
 }
 
+/* Для провідника: створити порожній файл (0 — ок, -1 — вже є, -2 — немає місця, -3 — погане ім'я) */
+int fs_new_file(const char *name)
+{
+	if (!name || !name[0]) return -3;
+	for (int i = 0; name[i]; i++)
+		if (i >= (int)sizeof(files[0].name) - 1) return -3;
+	if (fs_find(name)) return -1;
+	if (file_cout >= MAX_FILE) return -2;
+	strcpy(files[file_cout].name, name);
+	files[file_cout].data[0] = '\0';
+	files[file_cout].size = 0;
+	file_cout++;
+	return 0;
+}
+
+/* Видалити файл RAM-диска (0 — ок, -1 — нема такого) */
+int fs_delete(const char *name)
+{
+	for (int i = 0; i < file_cout; i++)
+	{
+		if (strcmp(files[i].name, name) == 0)
+		{
+			for (int j = i; j < file_cout - 1; j++)
+				files[j] = files[j + 1];
+			file_cout--;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* Перейменувати (0 — ок, -1 — нема такого, -2 — нове ім'я зайняте, -3 — погане ім'я) */
+int fs_rename_file(const char *from, const char *to)
+{
+	if (!to || !to[0]) return -3;
+	for (int i = 0; to[i]; i++)
+		if (i >= (int)sizeof(files[0].name) - 1) return -3;
+	FS_FILE *f = fs_find(from);
+	if (!f) return -1;
+	if (strcmp(from, to) == 0) return 0;
+	if (fs_find(to)) return -2;
+	strcpy(f->name, to);
+	return 0;
+}
+
 FS_FILE *fs_get_or_create(const char *name)
 {
 	FS_FILE *exisisting = fs_find(name);

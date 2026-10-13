@@ -1,0 +1,3 @@
+CMakeLists.txt not found in E:\MerdenOS
+Environment (MinGW/Cygwin) is not selected
+CMake executable not specified

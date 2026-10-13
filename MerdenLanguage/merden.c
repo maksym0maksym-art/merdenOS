@@ -40,7 +40,7 @@ static void mrd_strcpy_bounded(char *dst, const char *src, int max_len)
 typedef enum {
     TK_EOF, TK_NEWLINE, TK_IDENT, TK_NUMBER, TK_STRING,
 
-    TK_REMEMBER, TK_SAY, TK_WHEN, TK_OTHERWISE, TK_REPEAT,
+    TK_REMEMBER, TK_SET, TK_SAY, TK_WHEN, TK_OTHERWISE, TK_REPEAT, TK_IMPORT,
     TK_TRUE, TK_FALSE,
 
     TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT,
@@ -111,10 +111,12 @@ static void mrd_push_token(MTokenKind kind, int number, const char *text, int li
 static MTokenKind mrd_keyword_kind(const char *word)
 {
     if (mrd_streq(word, "remember"))  return TK_REMEMBER;
+    if (mrd_streq(word, "set"))       return TK_SET;
     if (mrd_streq(word, "say"))       return TK_SAY;
     if (mrd_streq(word, "when"))      return TK_WHEN;
     if (mrd_streq(word, "otherwise")) return TK_OTHERWISE;
     if (mrd_streq(word, "repeat"))    return TK_REPEAT;
+    if (mrd_streq(word, "import"))    return TK_IMPORT;
     if (mrd_streq(word, "true"))      return TK_TRUE;
     if (mrd_streq(word, "false"))     return TK_FALSE;
     return TK_IDENT;
@@ -580,9 +582,6 @@ static MValue mrd_expression(void)
     if (mrd_had_error) return mrd_number(0);
     return mrd_equality();
 }
-
-/* --------------------------- statements ---------------------------- */
-
 static void mrd_print_value(MValue v)
 {
     if (v.type == MVAL_NUMBER)
@@ -693,6 +692,41 @@ static void mrd_statement(void)
         return;
     }
 
+    if (mrd_match(TK_SET))
+    {
+        MToken *name_tok = mrd_consume(TK_IDENT, "A variable name is expected after 'set'");
+        if (mrd_had_error) return;
+        char name[MRD_MAX_STR];
+        mrd_strcpy_bounded(name, name_tok->text, MRD_MAX_STR);
+        int line = name_tok->line;
+
+        mrd_consume(TK_EQUAL, "The '=' sign is expected after the variable name");
+        if (mrd_had_error) return;
+
+        MValue value = mrd_expression();
+        if (mrd_had_error) return;
+
+        MVar *v = mrd_find_var(name);
+        if (!v)
+        {
+            mrd_error("Variable has not been created yet", line);
+            return;
+        }
+        if (v->value.type != value.type)
+        {
+            mrd_error("The new value has a different type", line);
+            return;
+        }
+        v->value = value;
+        return;
+    }
+
+    if (mrd_match(TK_IMPORT))
+    {
+        mrd_error("'import' is not supported in the OS yet", mrd_previous()->line);
+        return;
+    }
+
     if (mrd_match(TK_SAY))
     {
         int line = mrd_previous()->line;
@@ -774,7 +808,7 @@ static void mrd_statement(void)
         return;
     }
 
-    mrd_error("Expected a remember, say, when, or repeat command", mrd_peek()->line);
+    mrd_error("Expected a remember, set, say, when, or repeat command", mrd_peek()->line);
 }
 int merden_run(const char *source)
 {
