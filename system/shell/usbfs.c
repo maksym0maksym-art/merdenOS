@@ -8,18 +8,25 @@
 #include "../../kernel/headers/EXFAT.h"
 #include "../../kernel/headers/usb_dbg.h"
 #include "../../kernel/headers/rtc.h"
+#include "../../kernel/headers/IDE_drive.h"
+#include "../../standarts_lib/charset.h"
 
 void shell_print(char *text);
 
 /* Змонтовані томи ("диски" usb0:, usb1:, ...). Кожен том — ~33 КБ кешу, тому тільки статично (стек ядра — 16 КБ).
  * Поточний диск (cur) визначає, на що діють звичайні ls/cd/cat/...; cur < 0 — рідна файлова система ОС. */
-#define VOL_SLOTS 3
+#define VOL_SLOTS 6                      /* до 3 флешок + IDE-диски */
+#define IDE_BASE  USBFS_IDE_BASE         /* номер диска: usbN — N, IDE-диск hdN — 100 + N */
+#define IDE_AUTOSWITCH 1                 /* 1 — перший змонтований при старті IDE-диск стає поточним (як це робить флешка) */
 #define FS_FAT    1
 #define FS_EXFAT  2
 
+int rose_write(const char *text);
+int rose_exit(int code);
+
 typedef struct {
     int         used;
-    int         drive;                   /* номер флешки в usb_msc (usbN:) */
+    int         drive;                   /* usbN: — номер флешки в usb_msc; IDE_BASE + N — IDE-диск hdN: */
     int         fs;                      /* FS_FAT / FS_EXFAT */
     char        cwd[256];
     blockdev_t  bd;
@@ -32,6 +39,8 @@ static int         scanned;
 static int         need_rescan;             /* після eject останньої флешки: наступне звернення сканує заново */
 static uint8_t     iobuf[4096];
 
+static int is_ide(int drive) { return drive >= IDE_BASE; }
+
 /* ---- дрібні рядкові допоміжні (libc нема) ---- */
 static int  u_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static int  u_eq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
@@ -42,6 +51,22 @@ int  klog_booting(void);
 void klog_raw(const char *text);
 /* під час завантаження вивід іде в журнал ядра (з часом, потрапляє в dmesg) */
 static void out(const char *s) { if (klog_booting()) klog_raw(s); else shell_print((char *)s); }
+
+#include "ROSE_API.h"
+
+static void rose_api_write(const char *text)
+{
+    if (text)
+    {
+        out(text);
+    }
+}
+
+static const rose_api_t rose_api = {
+    .version = ROSE_API_VERSION,
+    .struct_size = sizeof(rose_api_t),
+    .write = rose_api_write
+};
 
 /* друк числа */
 static void out_u(uint32_t v) {
@@ -123,7 +148,24 @@ static void out_hex(uint32_t v, int digits);
 /* скан уже був (наш або при старті системи в mouse_init) — повторний скидає контролер і псує змонтовані диски */
 static int have_scan(void) { return !need_rescan && (scanned || usb_msc_count() > 0 || xhci_seen_count() > 0); }
 
-static void out_drive(int drive) { out("usb"); out_u((uint32_t)drive); out(":"); }
+static void out_drive(int drive) {
+    if (is_ide(drive)) { out("hd"); out_u((uint32_t)(drive - IDE_BASE)); }
+    else { out("usb"); out_u((uint32_t)drive); }
+    out(":");
+}
+
+int usbfs_drive_name(int drive, char *buf, int sz) {
+    const char *pre = is_ide(drive) ? "hd" : "usb";
+    uint32_t v = (uint32_t)(is_ide(drive) ? drive - IDE_BASE : drive);
+    char num[12]; int k = 0, n = 0;
+    if (!v) num[k++] = '0';
+    while (v && k < 11) { num[k++] = (char)('0' + v % 10); v /= 10; }
+    if (sz <= 0) return 0;
+    while (*pre && n < sz - 1) buf[n++] = *pre++;
+    while (k && n < sz - 1) buf[n++] = num[--k];
+    buf[n] = 0;
+    return n;
+}
 
 static vslot_t *slot_of_drive(int drive) {
     for (int i = 0; i < VOL_SLOTS; i++) if (slots[i].used && slots[i].drive == drive) return &slots[i];
@@ -131,12 +173,14 @@ static vslot_t *slot_of_drive(int drive) {
 }
 static int slot_index(vslot_t *s) { return (int)(s - slots); }
 
+/* тільки USB: IDE-диски постійні, `usb scan` (скидання контролера) їх не зачіпає */
 static void unmount_all(void) {
     for (int i = 0; i < VOL_SLOTS; i++) {
-        if (slots[i].used) v_flush(&slots[i]);
+        if (!slots[i].used || is_ide(slots[i].drive)) continue;
+        v_flush(&slots[i]);
         slots[i].used = 0;
     }
-    cur = -1;
+    if (cur >= 0 && !slots[cur].used) cur = -1;
 }
 
 static int do_scan(void) {
@@ -191,8 +235,60 @@ static void diagnose(usb_msc_t *m) {
     out("  Supported: FAT32 and exFAT. NTFS (and others) are not supported - reformat the drive as exFAT or FAT32.\n");
 }
 
+/* змонтувати IDE-диск hdN у вільний слот (FAT32 або exFAT, як на флешках); 0 — не вийшло */
+static vslot_t *mount_ide(int n, int verbose) {
+    int drive = IDE_BASE + n;
+    vslot_t *ex = slot_of_drive(drive);
+    if (ex) return ex;
+    blockdev_t *bd = ide_blockdev(n);
+    if (!bd) { if (verbose) { out("No such IDE disk: "); out_drive(drive); out(" (see `disks`)\n"); } return 0; }
+    vslot_t *s = 0;
+    for (int i = 0; i < VOL_SLOTS; i++) if (!slots[i].used) { s = &slots[i]; break; }
+    if (!s) { out("Too many mounted drives (max "); out_u(VOL_SLOTS); out(").\n"); return 0; }
+
+    s->bd = *bd;                                     /* ctx вказує на ide_devices[n] */
+    fat_set_clock(clock_get);
+    xf_set_clock(clock_get);
+    fat_part_info_t info;
+    s->fs = FS_FAT;
+    int rc = fat_mount(&s->v.f, &s->bd, -1, &info);
+    if (rc == FAT_E_FMT) { s->fs = FS_EXFAT; rc = xf_mount(&s->v.x, &s->bd, -1, &info); }
+    if (rc) {
+        if (verbose) {
+            out_drive(drive); out(" ("); out((const char *)ide_devices[n].Model); out("): ");
+            out(rc == FAT_E_FMT ? "no FAT32/exFAT file system (see `hd mbr "  : fat_strerror(rc));
+            if (rc == FAT_E_FMT) { out_u((uint32_t)n); out("`)"); }
+            out("\n");
+        }
+        return 0;
+    }
+    s->used = 1; s->drive = drive;
+    s->cwd[0] = '/'; s->cwd[1] = 0;
+    out("Mounted "); out_drive(drive); out(" "); out((const char *)ide_devices[n].Model);
+    out("  "); out(v_fsname(s));
+    if (v_label(s)[0]) { out("  label '"); out(v_label(s)); out("'"); }
+    if (v_ro(s)) out("  [READ ONLY]");
+    out("\n");
+    return s;
+}
+
+/* змонтувати всі IDE-диски з FAT32/exFAT; повертає скільки змонтовано (уже змонтовані теж рахуються) */
+static int mount_ide_all(int verbose) {
+    int ok = 0;
+    for (int i = 0; i < IDE_MAX_DRIVES; i++) {
+        if (!ide_blockdev(i)) continue;              /* слот порожній або це CD/DVD */
+        int had = slot_of_drive(IDE_BASE + i) != 0;
+        vslot_t *s = mount_ide(i, verbose);
+        if (!s) continue;
+        ok++;
+        if (!had && IDE_AUTOSWITCH && cur < 0) cur = slot_index(s);
+    }
+    return ok;
+}
+
 /* змонтувати флешку drive у вільний слот; 0 — помилка */
 static vslot_t *mount_drive(int drive, int verbose) {
+    if (is_ide(drive)) return mount_ide(drive - IDE_BASE, verbose);
     vslot_t *ex = slot_of_drive(drive);
     if (ex) return ex;
     usb_msc_t *m = usb_msc_get(drive);
@@ -251,15 +347,23 @@ static int need_mount(void) {
 /* розбір префікса диска "usbN:" на початку шляху; повертає слот (0 — немає префікса); *err = 1 — диск не змонтовано */
 static vslot_t *drive_prefix(const char **pp, int *err) {
     const char *p = *pp;
+    int base, i;
     *err = 0;
-    if (!(p[0] == 'u' && p[1] == 's' && p[2] == 'b')) return 0;
-    int i = 3, d = -1;
+    if (p[0] == 'u' && p[1] == 's' && p[2] == 'b') { base = 0; i = 3; }
+    else if (p[0] == 'h' && p[1] == 'd') { base = IDE_BASE; i = 2; }
+    else return 0;
+    int d = -1;
     while (p[i] >= '0' && p[i] <= '9') { d = (d < 0 ? 0 : d * 10) + (p[i] - '0'); i++; }
     if (p[i] != ':') return 0;
     *pp = p + i + 1;
     if (d < 0) return cur >= 0 ? &slots[cur] : (*err = 1, (vslot_t *)0);
+    d += base;
     vslot_t *s = slot_of_drive(d);
-    if (!s) { *err = 1; out_drive(d); out(" is not mounted (run `usb mount "); out_u((uint32_t)d); out("`)\n"); }
+    if (!s) {
+        *err = 1; out_drive(d);
+        if (base) out(" is not mounted (no such disk or no FAT32/exFAT; type `hdN:` to try again)\n");
+        else { out(" is not mounted (run `usb mount "); out_u((uint32_t)d); out("`)\n"); }
+    }
     return s;
 }
 
@@ -334,7 +438,7 @@ static void cmd_cat(const char *arg) {
         if (n == 0) break;
         for (int i = 0; i < n; i++) {
             uint8_t c = iobuf[i];
-            line[i] = (c == '\n' || (c >= 32 && c < 127)) ? (char)c : (c == '\t' ? ' ' : (c == '\r' ? 0 : '?'));
+            line[i] = (c == '\n' || cs_printable(c)) ? (char)c : (c == '\t' ? ' ' : (c == '\r' ? 0 : '?'));
             if (line[i] == 0) line[i] = ' ';
         }
         line[n] = 0;
@@ -467,25 +571,28 @@ static void cmd_run(const char *arg)
     out_u(load_size);
     out(" bytes\n");
 
-    /*
-     * Temporary execution model:
-     * entry point is a C function: int program(void).
-     *
-     * IMPORTANT: this runs in kernel mode, without isolation.
-     * Use only trusted test programs in QEMU.
-     */
-
+    uint32_t flags = mexe_u32(h + 16);
     uint8_t *code = mexe_image + header_size;
-    typedef int (*mexe_entry_t)(void);
 
-    mexe_entry_t entry =
-        (mexe_entry_t)(void *)(code + entry_offset);
+    out("Starting program....\n");
+    int result;
 
-    out("Starting program...\n");
+    if (flags & MEXE_FLAG_ROSE_API)
+    {
+        rose_program_api_t entry = (rose_program_api_t)(void *)(code + entry_offset);
 
-    int result = entry();
+        result = entry(&rose_api);
+    }
+    else 
+    {
+        typedef int (*mexe_entry_t)(void);
 
-    out("Program returned: ");
+        mexe_entry_t entry = (mexe_entry_t)(void *)(code + entry_offset);
+
+        result = entry();
+    }
+
+    out("Program returned");
     out_u((uint32_t)result);
     out("\n");
 }
@@ -638,6 +745,7 @@ static void cmd_help(void) {
     out("USB flash drives (xHCI; FAT32 and exFAT):\n");
     out("> usb scan                 -  find flash drives, mount them all, switch to the first\n");
     out("> usb0:  usb1: ...         -  switch to that drive (then plain ls/cd/cat/... work on it)\n");
+    out("> hd0:  hd1: ...           -  IDE disks (mounted at boot, FAT32/exFAT), work like usbN:\n");
     out("> ram:                     -  switch back to the system disk\n");
     out("> usb mount <N>            -  mount drive N and switch to it\n");
     out("> usb list                 -  all connected USB devices\n");
@@ -653,9 +761,11 @@ static void cmd_help(void) {
 /* ---- інтеграція з shell / терміналом / редактором ---- */
 int usbfs_mounted(void) { return cur >= 0; }
 
-/* При старті системи: флешки вже взяті першим скан-проходом (mouse_init) — просто монтуємо їх,
- * першою стає поточний диск (`ram:` повертає на системний). Без флешки нічого не робить і не друкує. */
+/* При старті системи: IDE-диски (hd0:, ...) монтуються самі, поточним диском вони не стають (IDE_AUTOSWITCH).
+ * Флешки вже взяті першим скан-проходом (mouse_init) — просто монтуємо їх, першою стає поточний диск
+ * (`ram:` повертає на системний). Без дисків нічого не робить і не друкує. */
 void usbfs_autostart(void) {
+    mount_ide_all(1);                                /* IDE-диски: ide_init() вже відпрацював у kernel_main */
     if (usb_msc_count() == 0) return;
     scanned = 1;
     mount_all();
@@ -666,8 +776,9 @@ const char *usbfs_prompt(void) {
     static char b[48];
     if (cur < 0) return "";
     int i = 0;
-    b[i++] = 'u'; b[i++] = 's'; b[i++] = 'b';
     uint32_t d = (uint32_t)slots[cur].drive;
+    if (is_ide((int)d)) { b[i++] = 'h'; b[i++] = 'd'; d -= IDE_BASE; }
+    else { b[i++] = 'u'; b[i++] = 's'; b[i++] = 'b'; }
     char num[8]; int k = 0;
     if (!d) num[k++] = '0';
     while (d && k < 7) { num[k++] = (char)('0' + d % 10); d /= 10; }
@@ -688,8 +799,10 @@ const char *usbfs_prompt(void) {
 
 /* edit <файл> при активному USB-диску -> "usb:файл" (відносно поточного каталогу диска) */
 static int has_drive_prefix(const char *a) {
-    if (!u_starts(a, "usb")) return 0;
-    int i = 3;
+    int i;
+    if (u_starts(a, "usb")) i = 3;
+    else if (u_starts(a, "hd")) i = 2;
+    else return 0;
     while (a[i] >= '0' && a[i] <= '9') i++;
     return a[i] == ':';
 }
@@ -835,6 +948,7 @@ int usbfs_rename(int drive, const char *from, const char *to) {
 
 int usbfs_rescan(void) {
     if (do_scan() == 0) mount_all();
+    mount_ide_all(0);                                /* IDE-диск могли відформатувати вже після старту */
     return usbfs_drive_count();
 }
 
@@ -845,16 +959,21 @@ static int switch_drive(const char *cmd) {
         out("Current drive: ram: (system disk)\n");
         return 1;
     }
-    if (!u_starts(cmd, "usb")) return 0;
-    int i = 3, d = -1;
+    int base, i;
+    if (u_starts(cmd, "usb")) { base = 0; i = 3; }
+    else if (u_starts(cmd, "hd")) { base = IDE_BASE; i = 2; }
+    else return 0;
+    int d = -1;
     while (cmd[i] >= '0' && cmd[i] <= '9') { d = (d < 0 ? 0 : d * 10) + (cmd[i] - '0'); i++; }
     if (cmd[i] != ':' || cmd[i + 1] != 0) return 0;
+    if (d < 0 && base) d = 0;                                 /* "hd:" = hd0: */
     if (d < 0) {                                              /* "usb:" — перший/поточний */
         if (cur >= 0) { out("Current drive: "); out_drive(slots[cur].drive); out("\n"); return 1; }
         mount_all();
         return 1;
     }
-    if (!have_scan() && do_scan()) return 1;
+    if (!base && !have_scan() && do_scan()) return 1;
+    d += base;
     vslot_t *s = mount_drive(d, 1);
     if (!s) return 1;
     cur = slot_index(s);
@@ -971,15 +1090,16 @@ int usbfs_command(const char *cmd) {
         if (!s) { out("not mounted\n"); return 1; }
         int rc = v_flush(s);
         if (rc) { fail("flush", rc); return 1; }
-        usb_msc_t *m = usb_msc_get(s->drive);
-        usb_msc_sync(m);
-        usb_msc_eject(m);
-        out_drive(s->drive); out(" ejected. You can unplug it now.\n");
+        int ide = is_ide(s->drive);
+        usb_msc_t *m = ide ? 0 : usb_msc_get(s->drive);
+        if (m) { usb_msc_sync(m); usb_msc_eject(m); }
+        out_drive(s->drive);
+        out(ide ? " unmounted (type its name, e.g. hd0:, to mount it again).\n" : " ejected. You can unplug it now.\n");
         if (slot_index(s) == cur) { cur = -1; out("Current drive: ram: (system disk)\n"); }
         s->used = 0;
         int any = 0;
-        for (int i = 0; i < VOL_SLOTS; i++) if (slots[i].used) any = 1;
-        if (!any) { scanned = 0; need_rescan = 1; }
+        for (int i = 0; i < VOL_SLOTS; i++) if (slots[i].used && !is_ide(slots[i].drive)) any = 1;
+        if (!any && !ide) { scanned = 0; need_rescan = 1; }
         return 1;
     }
 

@@ -20,6 +20,9 @@
 #include "../GUI/gui.h"
 #include "../../kernel/headers/usbfs.h"
 #include "../../kernel/headers/klog.h"
+#include "../../kernel/headers/schluder.h"
+#include "../../kernel/headers/png.h"
+#include "../../kernel/headers/memory.h"
 
 #define CHAR_WIDTH 8
 #define CHAR_HEIGHT 18 
@@ -183,6 +186,172 @@ void shell_print_int(int num)
     char buf[16];
     itoa(num, buf);
     shell_print(buf);
+}
+
+/* ---- планувальник: команди `tasks` і `tasktest` ---- */
+
+static void tasks_pad(int used, int width)
+{
+    while (used++ < width)
+        shell_print(" ");
+}
+
+static void tasks_print_num(int n, int width)
+{
+    int digits = 1;
+    for (int t = n; t >= 10; t /= 10)
+        digits++;
+    shell_print_int(n);
+    tasks_pad(digits, width);
+}
+
+static void tasks_print_str(const char *s, int width)
+{
+    int len = 0;
+    while (s[len])
+        len++;
+    shell_print((char *)s);
+    tasks_pad(len, width);
+}
+
+static void cmd_tasks(void)
+{
+    sched_info_t info;
+
+    shell_print("ID  NAME            STATE     RUNS    STACK(used/size)\n");
+    for (int slot = 0; slot < MAX_TASKS; slot++)
+    {
+        if (!scheduler_info(slot, &info))
+            continue;
+
+        tasks_print_num(info.id, 4);
+        tasks_print_str(info.name, 16);
+        tasks_print_str(task_state_name(info.state), 10);
+        tasks_print_num((int)info.runs, 8);
+
+        if (info.stack_size)
+        {
+            shell_print_int((int)info.stack_used);
+            shell_print("/");
+            shell_print_int((int)info.stack_size);
+        }
+        else
+        {
+            shell_print("boot stack");
+        }
+        shell_print("\n");
+    }
+    shell_print("Tasks alive: ");
+    shell_print_int(scheduler_count());
+    shell_print(" of ");
+    shell_print_int(MAX_TASKS);
+    shell_print("\n");
+}
+
+static void demo_task_a(void)
+{
+    for (int i = 0; i < 5; i++)
+    {
+        shell_print("[task A] tick ");
+        shell_print_int(i);
+        shell_print("\n");
+        task_sleep_ms(400);
+    }
+}
+
+static void demo_task_b(void)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        shell_print("[task B] tick ");
+        shell_print_int(i);
+        shell_print("\n");
+        task_sleep_ms(700);
+    }
+}
+
+/* ---- команда `png <файл>`: показує PNG з флешки на весь екран; будь-яка клавіша — вихід ---- */
+
+static void png_wait_key(void)
+{
+    while (inb(0x64) & 1)                       /* викинути все, що вже накопичилось */
+        inb(0x60);
+
+    for (;;)
+    {
+        unsigned char st = inb(0x64);
+        if (st & 1)
+        {
+            unsigned char sc = inb(0x60);
+            if (!(st & 0x20) && !(sc & 0x80) && sc != 0xE0)   /* 0x20 — байт PS/2-миші, 0x80 — відпускання клавіші */
+                return;
+        }
+        sched_yield();
+    }
+}
+
+static void cmd_png(const char *arg)
+{
+    while (*arg == ' ')
+        arg++;
+    if (!*arg)
+    {
+        shell_print("Usage: png <file.png>   (e.g. png usb0:/pic.png)\n");
+        return;
+    }
+
+    const uint32_t cap = 8u * 1024u * 1024u;
+    uint8_t *buf = (uint8_t *)kmalloc(cap);
+    if (!buf)
+    {
+        shell_print("png: not enough memory\n");
+        return;
+    }
+
+    uint32_t len = 0;
+    int rc = usbfs_read(arg, (char *)buf, cap, &len);
+    if (rc)
+    {
+        shell_print("png: cannot read file: ");
+        shell_print((char *)usbfs_strerror(rc));
+        shell_print("\n");
+        kfree(buf);
+        return;
+    }
+
+    png_info_t info;
+    rc = png_info(buf, len, &info);
+    if (rc != PNG_OK)
+    {
+        shell_print("png: ");
+        shell_print((char *)png_strerror(rc));
+        shell_print("\n");
+        kfree(buf);
+        return;
+    }
+
+    console_enter_alt();
+    clear_screen(0x000000);
+    rc = png_draw_fit(buf, len, 0, 0, framebuffer_width, framebuffer_height);
+    if (rc == PNG_OK)
+        png_wait_key();
+    console_exit_alt();
+
+    if (rc != PNG_OK)
+    {
+        shell_print("png: ");
+        shell_print((char *)png_strerror(rc));
+        shell_print("\n");
+    }
+    kfree(buf);
+}
+
+static void cmd_tasktest(void)
+{
+    if (add_tasks(demo_task_a, "demo_a") < 0 || add_tasks(demo_task_b, "demo_b") < 0)
+        shell_print("tasktest: cannot create tasks (table full or out of memory)\n");
+    else
+        shell_print("tasktest: started demo_a and demo_b, run `tasks` to see them\n");
 }
 
 int shell_atoi(const char *str)
@@ -1177,7 +1346,9 @@ void shell_execute_command(char* command)
         shell_print("> clear or cls:     -    clear screen\n");
         shell_print("> fastfetch:        -    systeminfo\n");
         shell_print("> about:            -    about of system\n");
-        shell_print("> tasks:            -    show_tasks\n");
+        shell_print("> tasks:            -    list scheduler tasks\n");
+        shell_print("> tasktest:         -    start two demo background tasks\n");
+        shell_print("> png <file>:       -    show a PNG from a USB drive (any key to exit)\n");
         shell_print("> mem:              -    memory info \n");
         shell_print("> echo:             -    print text(in future for files)\n");
         shell_print("> shutdown:         -    shutdown your computer\n");
@@ -1227,7 +1398,15 @@ void shell_execute_command(char* command)
     }
     else if ((strcmp(command, "tasks") == 0) || (strcmp(command, "tasks ") == 0))
     {
-        shell_print("Scheluder: enabled\n");
+        cmd_tasks();
+    }
+    else if (strncmp(command, "png ", 4) == 0 || strcmp(command, "png") == 0)
+    {
+        cmd_png(command + (command[3] ? 4 : 3));
+    }
+    else if ((strcmp(command, "tasktest") == 0) || (strcmp(command, "tasktest ") == 0))
+    {
+        cmd_tasktest();
     }
     else if ((strcmp(command, "mem") == 0) || (strcmp(command, "mem ") == 0))
     {

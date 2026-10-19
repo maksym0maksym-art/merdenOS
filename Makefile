@@ -1,7 +1,7 @@
 EFI_CC = gcc
 EFI_CRFLAGS = -I /usr/include/efi -I /usr/include/efi/x86_64 -fPIC -fshort-wchar -mno-red-zone -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers
 
-CFLAGS = -m32 -ffreestanding -fno-pie -fno-pic -g -O0 -fno-stack-protector
+CFLAGS = -m32 -ffreestanding -fno-pie -fno-pic -g -O0 -fno-stack-protector -fexec-charset=CP1251 -DFS_NAMES_CP1251
 LDFLAGS = -m elf_i386 -nostdlib -T kernel/linker/linker.ld
 
 GUI_CFLAGS    = $(CFLAGS) -DGUI_BUILD
@@ -54,6 +54,11 @@ all:
 	gcc $(CFLAGS) -c kernel/code/memory/pmm.c -o build/obj/pmm.o
 	gcc $(CFLAGS) -c kernel/code/drivers/mushka/ps2.c -o build/obj/ps2_mouse.o
 	gcc $(CFLAGS) -c kernel/code/memory/memory.c -o build/obj/memory.o
+	gcc $(CFLAGS) -c kernel/schluder/schluder.c -o build/obj/schluder.o
+	gcc $(CFLAGS) -O2 -c kernel/code/drivers/png.c -o build/obj/png.o
+	gcc $(CFLAGS) -O2 -c kernel/code/drivers/pndraw.c -o build/obj/pngdraw.o
+	gcc $(CFLAGS) -c system/GUI/imgview.c -o build/obj/imgview.o
+	nasm -f elf32 kernel/schluder/switch.asm -o build/obj/switch.elf
 	gcc $(CFLAGS) -c system/GUI/calc.c -o build/obj/calc.o 
 	gcc $(CFLAGS) -c MerdenLanguage/merden.c -o build/obj/merden.o 
 	gcc $(CFLAGS) -c kernel/code/drivers/klog.c -o build/obj/klog.o
@@ -84,6 +89,11 @@ all:
 		build/obj/exfat_fs.o \
 		build/obj/pmm.o \
 		build/obj/memory.o \
+		build/obj/schluder.o \
+		build/obj/png.o \
+		build/obj/pngdraw.o \
+		build/obj/imgview.o \
+		build/obj/switch.elf \
 		build/obj/explorer.o \
 		build/obj/usbfs.o \
 		build/obj/syntax_c.o \

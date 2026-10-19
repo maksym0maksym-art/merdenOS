@@ -4,6 +4,7 @@
 #include "../../kernel/headers/usbfs.h"
 #include "../../kernel/headers/ram_files.h"
 #include "../../kernel/headers/klog.h"
+#include "../../standarts_lib/charset.h"
 
 /* Провідник файлів.
  *   ліворуч — диски (RAM-диск, змонтовані USB-флешки, «Scan USB»);
@@ -69,7 +70,7 @@ static uint16_t order[MAXE];
 static int s_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static void s_copy(char *d, int sz, const char *s) { int i = 0; while (s[i] && i < sz - 1) { d[i] = s[i]; i++; } d[i] = 0; }
 static int s_eq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
-static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static char lower(char c) { return (char)cs_lower((unsigned char)c); }
 static int ci_cmp(const char *a, const char *b) {
     while (*a && *b) {
         char x = lower(*a), y = lower(*b);
@@ -250,6 +251,13 @@ static void act_up(void) {
     redraw();
 }
 
+static int is_png_name(const char *n) {
+    int l = s_len(n);
+    if (l < 5) return 0;
+    const char *e = n + l - 4;
+    return e[0] == '.' && (e[1] | 32) == 'p' && (e[2] | 32) == 'n' && (e[3] | 32) == 'g';
+}
+
 static void act_open(void) {
     const usbfs_entry_t *e = cur_entry();
     if (!e) return;
@@ -264,7 +272,11 @@ static void act_open(void) {
     } else {
         char name[PATH_MAX_ + 8];
         full_name_for_editor(name, sizeof name, e->name);
-        if (!gui_editor_open(name)) set_msg("Cannot open editor (too many windows?)", 1);
+        if (X.drive >= 0 && is_png_name(e->name)) {
+            if (!gui_image_open(name)) set_msg("Cannot open image viewer (too many windows?)", 1);
+        } else if (!gui_editor_open(name)) {
+            set_msg("Cannot open editor (too many windows?)", 1);
+        }
     }
     redraw();
 }
@@ -312,7 +324,7 @@ static void begin_name(int mode) {
 }
 
 static int name_char_ok(int c) {
-    if (c < 32 || c > 126) return 0;
+    if (c < 0 || c > 255 || !cs_printable(c)) return 0;
     switch (c) { case '/': case '\\': case ':': case '*': case '?': case '"': case '<': case '>': case '|': return 0; }
     return 1;
 }
@@ -389,7 +401,7 @@ static void draw_trunc(int x, int y, int maxch, const char *s, uint32_t col) {
     int cut = l > maxch;
     int lim = cut ? maxch - 2 : l;
     if (lim < 0) lim = 0;
-    for (int i = 0; i < lim && n < 296; i++) { unsigned char c = (unsigned char)s[i]; b[n++] = (c >= 32 && c < 127) ? (char)c : '?'; }
+    for (int i = 0; i < lim && n < 296; i++) { unsigned char c = (unsigned char)s[i]; b[n++] = cs_printable(c) ? (char)c : '?'; }
     if (cut && maxch >= 2) { b[n++] = '.'; b[n++] = '.'; }
     b[n] = 0;
     gui_draw_text(x, y, b, col);

@@ -177,6 +177,7 @@ gui_window_t *gui_terminal_open(void);
 gui_window_t *gui_editor_open(const char *filename);
 gui_window_t *gui_calc_open(void);
 gui_window_t *gui_explorer_open(void);
+gui_window_t *gui_image_open(const char *path);     /* PNG з USB-флешки: "usbN:/dir/pic.png" */
 
 /* ---------- Віджети ---------- */
 
@@ -194,6 +195,9 @@ void gui_draw_text(int x, int y, const char *s, uint32_t color);
 void gui_draw_rrect(int x, int y, int w, int h, uint32_t color);                /* із заокругленими кутами */
 void gui_draw_char_scaled(int x, int y, char ch, uint32_t color, int scale);    /* символ у scale разів більший */
 void gui_get_clip(int *x, int *y, int *w, int *h);
+/* Картинка 0xAARRGGBB розміром sw x sh, розтягнута (найближчий сусід) до w x h у точці (x, y);
+ * обрізається по clip, прозорість змішується з тим, що вже намальовано. */
+void gui_draw_image(int x, int y, int w, int h, const uint32_t *src, int sw, int sh);
 
 #ifdef __cplusplus
 }

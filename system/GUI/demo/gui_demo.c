@@ -15,7 +15,6 @@ static void launch_editor(void)   { gui_editor_open("untitled.txt"); }
 static void launch_calc(void)     { gui_calc_open(); }
 static void launch_paint(void)    { paint_open(); }
 static void launch_explorer(void) { gui_explorer_open(); }
-static void exit_gui(void)        { gui_quit(); }
 
 void cmd_gui(void) {
     static int mouse_ready = 0;
@@ -45,7 +44,6 @@ void cmd_gui(void) {
     gui_menu_add_ex("Calculator",  GUI_ICON_CALC,     launch_calc);
     gui_menu_add_ex("Paint",       GUI_ICON_PAINT,    launch_paint);
     gui_menu_add_ex("Explorer",    GUI_ICON_FOLDER,   launch_explorer);
-    gui_menu_add_ex("Exit GUI",    GUI_ICON_POWER,    exit_gui);
 
     mouse_set_pos((int32_t)(framebuffer_width / 2), (int32_t)(framebuffer_height / 2));
     mouse_cursor_show();

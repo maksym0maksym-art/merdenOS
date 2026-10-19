@@ -8,7 +8,7 @@
 #include "../../headers/memory.h"
 
 #define PAGE_SIZE       4096u
-#define HEAP_SIZE       (16u * PAGE_SIZE)
+#define HEAP_SIZE       (8192u * PAGE_SIZE)  /* 32 МіБ: стеки задач, файл PNG і розпакований кадр беруться звідси */
 #define ALIGNMENT       16u
 #define BLOCK_MAGIC     0x4D45524Du
 
@@ -22,7 +22,7 @@ typedef struct block_meta {
 #define META_SIZE \
     ((sizeof(block_meta_t) + ALIGNMENT - 1u) & ~(ALIGNMENT - 1u))
 
-/* Тимчасова купа: 64 КіБ, вирівняна на 16 байтів. */
+/* Тимчасова купа: 32 МіБ (у .bss), вирівняна на 16 байтів. */
 static uint8_t heap_storage[HEAP_SIZE]
     __attribute__((aligned(16)));
 

@@ -1,158 +1,85 @@
 #ifndef IDE_IO_H
 #define IDE_IO_H
 
+#include <stdint.h>
+#include "blockdev.h"
+
+/*
+ * Legacy IDE/ATA (PIO, LBA28) — те, що емулюють QEMU/VirtualBox/VMware (-drive if=ide)
+ * і що дає режим сумісності в BIOS на залізі. Порти фіксовані: primary 0x1F0/0x3F6,
+ * secondary 0x170/0x376. DMA, переривання, LBA48 і ATAPI поки нема: диск видно в межах
+ * перших 128 ГіБ, читання/запис — PIO по секторах.
+ *
+ * Номер диска (drive, "hdN") — порядок знаходження: 0..3 серед усіх знайдених пристроїв.
+ */
+
+#define IDE_MAX_DRIVES   4
+#define IDE_SECTOR_SIZE  512
+
+/* коди помилок (package[0], ide_strerror) */
+#define IDE_OK           0
+#define IDE_E_DF         1   /* Device Fault */
+#define IDE_E_ERR        2   /* пристрій виставив ERR */
+#define IDE_E_NODRIVE    3   /* такого диска нема */
+#define IDE_E_TIMEOUT    4   /* BSY/DRQ не дочекались */
+#define IDE_E_RANGE      5   /* LBA за межами диска (або вище LBA28) */
+#define IDE_E_NOLBA      6   /* диск без LBA */
+#define IDE_E_NOTATA     7   /* це ATAPI (CD) — читання поки не вміємо */
+
+#define IDE_ATA          0x00   /* ide_devices[].Type (значення збігаються з тими, що давно є в shell.c) */
+#define IDE_ATAPI        0x01
+
 struct IDEChannelRegisters
 {
-    unsigned int  base;
-    unsigned int  ctrl;
+    unsigned int  base;     /* командний блок: 0x1F0 / 0x170 */
+    unsigned int  ctrl;     /* порт Device Control / Alt Status: 0x3F6 / 0x376 */
     unsigned int  bmide;
     unsigned char nIEN;
 };
 
-/* ============================================================
- * IDE DEVICE INFORMATION
- * ============================================================ */
-
 struct ide_devices_s
 {
-    unsigned char  Reserved;
+    unsigned char  Reserved;     /* 1 — слот зайнятий */
     unsigned char  channel;
-    unsigned char  Drive;
+    unsigned char  Drive;        /* 0 master, 1 slave */
 
-    unsigned short Type;
+    unsigned short Type;         /* 0 ATA, 1 ATAPI */
     unsigned short Signature;
     unsigned short Capabilities;
 
     unsigned int   CommandSets;
-    unsigned int   Size;
+    unsigned int   Size;         /* секторів по 512 Б */
 
     unsigned char  Model[41];
 };
 
-/* ============================================================
- * GLOBAL DRIVER STATE
- * ============================================================ */
-
 extern struct IDEChannelRegisters channels[2];
-
 extern unsigned char ide_buf[2048];
-
-extern volatile unsigned char ide_irq_invoked;
-
 extern unsigned char atapi_packet[12];
+extern struct ide_devices_s ide_devices[IDE_MAX_DRIVES];
+extern unsigned char package[2];   /* package[0] — код останньої помилки ide_read/write_sectors */
 
-extern struct ide_devices_s ide_devices[4];
+/* BAR0..BAR4 = 0 — класичні порти (так і викликає kernel.c) */
+void ide_init(unsigned int BAR0, unsigned int BAR1,
+              unsigned int BAR2, unsigned int BAR3,
+              unsigned int BAR4);
 
-extern unsigned char package[2];
+int  ide_drive_count(void);                       /* скільки пристроїв знайдено (ATA + ATAPI) */
+const char *ide_strerror(int code);
 
-/* ============================================================
- * LOW-LEVEL I/O
- * ============================================================ */
+/* сирий доступ; повертає IDE_OK або IDE_E_*. count — будь-яке (ріжеться на шматки по 128 секторів).
+ * ide_write_blocks не скидає кеш диска — це робить ide_flush_drive (blockdev.flush викликає саме його). */
+int  ide_read_blocks(int drive, uint32_t lba, uint32_t count, void *buf);
+int  ide_write_blocks(int drive, uint32_t lba, uint32_t count, const void *buf);
+int  ide_flush_drive(int drive);
 
-static inline void io_delay(void);
+/* стара пара функцій (результат у package[0]); write тут одразу робить CACHE FLUSH */
+void ide_read_sectors(unsigned char drive, unsigned char numsects,
+                      unsigned int lba, unsigned char *buffer);
+void ide_write_sectors(unsigned char drive, unsigned char numsects,
+                       unsigned int lba, unsigned char *buffer);
 
-static inline void insl(
-    unsigned short port,
-    void *addr,
-    unsigned int count
-);
-
-static inline void insw(
-    unsigned short port,
-    void *addr,
-    unsigned int count
-);
-
-static inline void outsw(
-    unsigned short port,
-    void *addr,
-    unsigned int count
-);
-
-/* ============================================================
- * IDE REGISTER ACCESS
- * ============================================================ */
-
-void ide_write(
-    unsigned char channel,
-    unsigned char reg,
-    unsigned char data
-);
-
-unsigned char ide_read(
-    unsigned char channel,
-    unsigned char reg
-);
-
-void ide_read_buffer(
-    unsigned char channel,
-    unsigned char reg,
-    void *buffer,
-    unsigned int quads
-);
-
-/* ============================================================
- * IDE STATUS / ERROR
- * ============================================================ */
-
-unsigned char ide_pooling(
-    unsigned char channel,
-    unsigned int advanced_check
-);
-
-unsigned char ide_print_error(
-    unsigned int drive,
-    unsigned char err
-);
-
-/* ============================================================
- * IDE INITIALIZATION
- * ============================================================ */
-
-void ide_init(
-    unsigned int BAR0,
-    unsigned int BAR1,
-    unsigned int BAR2,
-    unsigned int BAR3,
-    unsigned int BAR4
-);
-
-/* ============================================================
- * ATA / ATAPI ACCESS
- * ============================================================ */
-
-unsigned char ide_ata_access(
-    unsigned char direction,
-    unsigned char drive,
-    unsigned int lba,
-    unsigned char numsects
-);
-
-unsigned char ide_atapi_read(
-    unsigned char drive,
-    unsigned int lba,
-    unsigned char numsects,
-    unsigned short es,
-    unsigned int edi
-);
-
-/* ============================================================
- * SECTOR OPERATIONS
- * ============================================================ */
-
-void ide_read_sectors(
-    unsigned char drive,
-    unsigned char numsects,
-    unsigned int lba,
-    unsigned char *buffer
-);
-
-void ide_write_sectors(
-    unsigned char drive,
-    unsigned char numsects,
-    unsigned int lba,
-    unsigned short es,
-    unsigned int edi
-);
+/* blockdev для fat_mount() та ін.; NULL — диска нема або це не ATA. Масив статичний. */
+blockdev_t *ide_blockdev(int drive);
 
 #endif /* IDE_IO_H */

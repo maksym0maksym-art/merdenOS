@@ -1,5 +1,8 @@
 #include <stdint.h>
 #include "../headers/EXFAT.h"
+#ifdef FS_NAMES_CP1251
+#include "../../standarts_lib/charset.h"   /* імена в API — CP1251, на диску — UTF-16 */
+#endif
 
 #define XF_EOC        0xFFFFFFFFu
 #define XF_EOC_MIN    0xFFFFFFF8u
@@ -35,6 +38,11 @@ static uint32_t utf8_next(const char **sp) {
     uint32_t c = s[0];
     if (c == 0) return 0;
     if (c < 0x80) { *sp += 1; return c; }
+#ifdef FS_NAMES_CP1251
+    /* імена, що йдуть із шелла/GUI, — CP1251: один байт = один символ */
+    *sp += 1;
+    return cs_to_unicode((unsigned char)c);
+#endif
     if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) { *sp += 2; return ((c & 0x1F) << 6) | (s[1] & 0x3F); }
     if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
         *sp += 3; return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
@@ -66,6 +74,11 @@ static int utf8_to_utf16(const char *s, uint16_t *out, int cap) {
 }
 
 static int put_utf8(char *out, int pos, int cap, uint32_t c) {
+#ifdef FS_NAMES_CP1251
+    if (pos + 1 >= cap) return -1;
+    out[pos] = (char)cs_from_unicode(c);
+    return pos + 1;
+#endif
     int need = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
     if (pos + need >= cap) return -1;
     if (need == 1) out[pos] = (char)c;

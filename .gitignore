@@ -1,2 +1,9 @@
 build/
 trash/
+test/
+.vs/
+.vscode/
+.idea/
+.kdev4/
+cmake-build-debug/
+.obsidian/

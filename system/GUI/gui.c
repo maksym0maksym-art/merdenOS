@@ -4,9 +4,13 @@
 #include "../../kernel/headers/framebuffer.h"
 #include "../../kernel/headers/keyboard.h"
 #include "../../kernel/headers/rtc.h"
+#include "../../kernel/headers/acpi.h"
+#include "../../kernel/headers/xhci.h"
 #include "../../kernel/headers/i2c_dw.h"      /* i2c_now / i2c_cycles_per_ms — годинник для анімацій */
 #include "../../kernel/fonts/fonts.h"
 #include "../../kernel/code/drivers/io.h"
+#include "../../kernel/headers/schluder.h"
+#include "../../standarts_lib/charset.h"
 
 /* жест трьома пальцями з touchpad.c: -1 — пальці пішли ліворуч, +1 — праворуч, 0 — нічого */
 extern int tp_swipe_pop(void);
@@ -178,6 +182,8 @@ static unsigned long stat_render_px, stat_flip_px;
 #endif
 
 static void flush(void);
+static void flip(rect_t r);
+static int kbd_poll(gui_key_t *out);
 
 static gui_window_t pool[GUI_MAX_WINDOWS];
 static gui_window_t *order[GUI_MAX_WINDOWS];   /* z-порядок */
@@ -426,6 +432,31 @@ static void gfx_bevel(int x, int y, int w, int h, uint32_t tl, uint32_t br) {
 }
 
 void gui_draw_rect(int x, int y, int w, int h, uint32_t color)   { gfx_fill(x, y, w, h, color); }
+void gui_draw_image(int x, int y, int w, int h, const uint32_t *src, int sw, int sh) {
+    if (!src || w <= 0 || h <= 0 || sw <= 0 || sh <= 0) return;
+    int x0 = imax(x, clip.x), y0 = imax(y, clip.y);
+    int x1 = imin(x + w, clip.x + clip.w), y1 = imin(y + h, clip.y + clip.h);
+    if (x1 <= x0 || y1 <= y0) return;
+
+    for (int py = y0; py < y1; py++) {
+        const uint32_t *srow = src + (uint32_t)(((py - y) * sh) / h) * (uint32_t)sw;
+        uint32_t *drow = &back[py * W];
+        for (int px = x0; px < x1; px++) {
+            uint32_t s = srow[((px - x) * sw) / w];
+            uint32_t a = s >> 24;
+            if (a == 255u) {
+                drow[px] = s & 0x00FFFFFFu;
+            } else if (a) {
+                uint32_t b = drow[px];
+                uint32_t r  = (((s >> 16) & 255u) * a + ((b >> 16) & 255u) * (255u - a) + 127u) / 255u;
+                uint32_t g  = (((s >> 8)  & 255u) * a + ((b >> 8)  & 255u) * (255u - a) + 127u) / 255u;
+                uint32_t bl = ((s & 255u) * a + (b & 255u) * (255u - a) + 127u) / 255u;
+                drow[px] = (r << 16) | (g << 8) | bl;
+            }
+        }
+    }
+}
+
 void gui_get_clip(int *x, int *y, int *w, int *h) {
     if (x) *x = clip.x;
     if (y) *y = clip.y;
@@ -1250,6 +1281,8 @@ static void draw_task_icon(int x, int y, int icon_id, int scale)
 }
 
 #define MENU_PW        320
+#define MENU_SIDE_W    56     /* вузька бічна панель зліва: кнопка живлення зверху, напис знизу */
+#define MENU_LX        (MENU_SIDE_W + MENU_PAD)   /* відступ списку від лівого краю меню */
 #define MENU_PAD       10
 #define MENU_SEARCH_H  34
 #define MENU_ROW_H     50
@@ -1269,6 +1302,19 @@ static void draw_task_icon(int x, int y, int icon_id, int scale)
 #define MC_THUMB   0xB0B0B0
 
 typedef struct { const char *label; int icon; void (*fn)(void); } menu_item_t;
+/* випадне міні-меню живлення (кнопка зверху бічної панелі) */
+#define PW_N     4
+#define PW_ROW_H 40
+#define PW_W     196
+#define PW_PAD   8
+#define PW_BTN   36
+enum { PW_SHUTDOWN = 0, PW_EXIT, PW_RESTART, PW_SLEEP };
+static const char *const pw_labels[PW_N] = { "Shut down", "Exit GUI", "Restart", "Sleep" };
+static int pw_open;
+static int pw_sel;
+static int sleeping;
+static int sleep_moved;
+
 static menu_item_t menu_items[GUI_MENU_MAX];
 static int  menu_count;
 static char menu_q[24];
@@ -1288,7 +1334,7 @@ int gui_menu_add_ex(const char *label, int icon, void (*fn)(void)) {
 
 int gui_menu_add(const char *label, void (*fn)(void)) { return gui_menu_add_ex(label, GUI_ICON_APP, fn); }
 
-static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static char lc(char c) { return (char)cs_lower((unsigned char)c); }
 
 static int menu_match(const char *label) {
     if (!menu_qlen) return 1;
@@ -1322,7 +1368,7 @@ static void menu_rect(int *x, int *y, int *w, int *h) {
     int ph = MENU_PAD + MENU_SEARCH_H + MENU_PAD + menu_list_h() + MENU_PAD;
     *x = START_X;
     *y = TASKBAR_TOP ? GUI_TASKBAR_H + 4 : H - GUI_TASKBAR_H - 4 - ph;
-    *w = MENU_PW;
+    *w = MENU_SIDE_W + MENU_PW;
     *h = ph;
 }
 
@@ -1336,7 +1382,7 @@ static void inv_menu(void) {
 static int menu_item_at(int px, int py) {
     int x, y, w, h;
     menu_rect(&x, &y, &w, &h);
-    int lx = x + MENU_PAD, ly = y + MENU_PAD + MENU_SEARCH_H + MENU_PAD;
+    int lx = x + MENU_LX, ly = y + MENU_PAD + MENU_SEARCH_H + MENU_PAD;
     if (px < lx || px >= lx + MENU_CARD_W) return -1;
     int rel = py - ly;
     if (rel < 0) return -1;
@@ -1356,12 +1402,14 @@ static void menu_close(void) {
     if (!start_open) return;
     inv_menu();
     start_open = 0;
+    pw_open = 0;
     inv_taskbar();
 }
 
 static void menu_open(void) {
     if (!menu_count) { if (launcher) launcher(); return; }   /* меню порожнє — стара поведінка */
     start_open = 1;
+    pw_open = 0;
     menu_qlen = 0;
     menu_refilter();
     inv_menu();
@@ -1377,9 +1425,208 @@ static void menu_launch(int v) {
     if (fn) fn();
 }
 
+
+/* ---------------- Живлення: бічна панель, міні-меню, вимкнення / перезавантаження / сон ---------------- */
+
+/* кнопка живлення — зверху бічної панелі */
+static void pw_btn_rect(int *x, int *y) {
+    int mx, my, mw, mh;
+    menu_rect(&mx, &my, &mw, &mh);
+    *x = mx + 6 + (MENU_SIDE_W - 12 - PW_BTN) / 2;
+    *y = my + 10;
+}
+
+/* випадне міні-меню — праворуч від кнопки, поверх списку */
+static void pw_rect(int *x, int *y, int *w, int *h) {
+    int bx, by;
+    pw_btn_rect(&bx, &by);
+    *x = bx + PW_BTN + 6;
+    *y = by;
+    *w = PW_W;
+    *h = PW_N * PW_ROW_H + 2 * PW_PAD;
+}
+
+static int pw_item_at(int px, int py) {
+    int x, y, w, h;
+    pw_rect(&x, &y, &w, &h);
+    if (px < x + 6 || px >= x + w - 6) return -1;
+    int rel = py - (y + PW_PAD);
+    if (rel < 0) return -1;
+    int i = rel / PW_ROW_H;
+    if (i >= PW_N || rel % PW_ROW_H >= PW_ROW_H - 4) return -1;
+    return i;
+}
+
+/* 16x16 значки міні-меню (малюються піксель за пікселем) */
+static int pw_icon_px(int kind, int x, int y) {
+    int dx = 2 * x - 15, dy = 2 * y - 15;
+    if (kind == PW_EXIT) {                      /* двері зі стрілкою */
+        if (x == 2 && y >= 2 && y <= 13) return 1;
+        if ((y == 2 || y == 13) && x >= 2 && x <= 8) return 1;
+        if ((y == 7 || y == 8) && x >= 6 && x <= 13) return 1;
+        for (int j = 0; j < 4; j++)
+            if (x == 10 + j && y >= 4 + j && y <= 11 - j) return 1;
+        return 0;
+    }
+    if (kind == PW_RESTART) {                   /* кільце зі стрілкою */
+        int r2 = dx * dx + dy * dy;
+        if (r2 >= 81 && r2 <= 196 && !(dx > 0 && dy < 0)) return 1;
+        if (y == 3 && x == 13) return 1;
+        if (y == 4 && x >= 12 && x <= 14) return 1;
+        if (y == 5 && x >= 11 && x <= 15) return 1;
+        if ((y == 6 || y == 7) && x >= 12 && x <= 14) return 1;
+        return 0;
+    }
+    if (kind == PW_SLEEP) {                     /* місяць */
+        int bx = dx - 7, by = dy + 5;
+        return (dx * dx + dy * dy <= 169) && !(bx * bx + by * by <= 121);
+    }
+    return 0;
+}
+
+static void draw_pw_icon(int kind, int x, int y) {
+    if (kind == PW_SHUTDOWN) { draw_menu_icon(GUI_ICON_POWER, x, y, 1); return; }
+    for (int iy = 0; iy < 16; iy++)
+        for (int ix = 0; ix < 16; ix++)
+            if (pw_icon_px(kind, ix, iy)) gfx_fill(x + ix, y + iy, 1, 1, 0xF0F0F0);
+}
+
+/* текст, повернутий на 90° проти годинникової (читається знизу вгору); (x, bottom) — лівий нижній кут першого символу */
+static void gfx_text_up(int x, int bottom, const char *s, uint32_t fg, int sc) {
+    for (int i = 0; s[i]; i++) {
+        const uint8_t *g = font8x18[(uint8_t)s[i]];
+        int top = bottom - (i + 1) * 8 * sc;
+        for (int row = 0; row < 18; row++) {
+            uint8_t bits = g[row];
+            for (int col = 0; col < 8; col++)
+                if (bits & (0x80 >> col))
+                    gfx_fill(x + row * sc, top + (7 - col) * sc, sc, sc, fg);
+        }
+    }
+}
+
+static void draw_menu_side(int x, int y, int w, int h) {
+    (void)w;
+    int sw = MENU_SIDE_W - 12;
+    gfx_rfill_a(x + 6, y + 6, sw, h - 12, MC_SEARCH, 256);
+
+    int bx, by;
+    pw_btn_rect(&bx, &by);
+    gfx_rfill_a(bx, by, PW_BTN, PW_BTN, pw_open ? MC_CARD_ON : MC_CARD, 256);
+    draw_menu_icon(GUI_ICON_POWER, bx + (PW_BTN - 32) / 2, by + (PW_BTN - 32) / 2, 2);
+
+    /* напис «MerdenOS» знизу, вертикально; якщо панель задалека коротка — не малюємо */
+    const int sc = 2, len = 8;
+    int text_h = len * 8 * sc;
+    int bottom = y + h - 6 - 12;
+    if (bottom - text_h > by + PW_BTN + 8)
+        gfx_text_up(x + 6 + (sw - 18 * sc) / 2, bottom, "MerdenOS", C_BORDER, sc);
+}
+
+static void draw_power_popup(void) {
+    if (!pw_open) return;
+    int x, y, w, h;
+    pw_rect(&x, &y, &w, &h);
+    gfx_rfill_a(x, y, w, h, MC_PANEL, 256);
+    gfx_fill(x + 3, y, w - 6, 1, MC_BORDER);
+    gfx_fill(x + 3, y + h - 1, w - 6, 1, MC_BORDER);
+    gfx_fill(x, y + 3, 1, h - 6, MC_BORDER);
+    gfx_fill(x + w - 1, y + 3, 1, h - 6, MC_BORDER);
+
+    for (int i = 0; i < PW_N; i++) {
+        int ry = y + PW_PAD + i * PW_ROW_H, rh = PW_ROW_H - 4;
+        int on = (i == pw_sel);
+        gfx_rfill_a(x + 6, ry, w - 12, rh, on ? MC_CARD_ON : MC_CARD, 256);
+        draw_pw_icon(i, x + 6 + 10, ry + (rh - 16) / 2);
+        gfx_text(x + 6 + 10 + 16 + 10, ry + (rh - 18) / 2, pw_labels[i], on ? 0xFFFFFF : MC_TEXT);
+    }
+}
+
+/* повністю чорний екран з (необов'язковим) написом по центру */
+static void power_screen(const char *msg) {
+    mouse_cursor_hide();
+    rect_t full = { 0, 0, W, H };
+    clip = full;
+    gfx_fill(0, 0, W, H, 0x000000);
+    if (msg) gfx_text((W - gui_strlen(msg) * 8) / 2, (H - 18) / 2, msg, 0xC8C8C8);
+    flip(full);
+}
+
+/* перед вимкненням/перезавантаженням: без переривань і зупиняємо USB-контролер (він інакше пише в пам'ять через DMA) */
+static void power_prepare(void) {
+    asm volatile("cli");
+    xhci_shutdown();
+}
+
+/* Сон: чорний екран, вхід ігнорується, поки не натиснуть клавішу / кнопку миші чи не посунуть мишу.
+ * Справжній ACPI S3 вимагає коду відновлення після пробудження (waking vector) і драйверів, що
+ * вміють перезапускатись, — тож це програмний сон, який однаково поводиться на ВМ і на залозі. */
+static void sleep_enter(void) {
+    nrr = nfr = 0;
+    power_screen(0);
+    sleeping = 1;
+    sleep_moved = 0;
+}
+
+static void sleep_poll(void) {
+    gui_key_t k;
+    int wake = 0;
+
+    for (int n = 0; n < 64; n++) {
+        int r = kbd_poll(&k);
+        if (r < 0) break;
+        if (r > 0) wake = 1;
+    }
+
+    if (mouse_poll()) {
+        const mouse_state_t *m = mouse_get();
+        sleep_moved += iabs(m->dx) + iabs(m->dy);
+        if (m->pressed || m->wheel || sleep_moved >= 24) wake = 1;
+    }
+
+    if (!wake) {
+        asm volatile("pause");
+        return;
+    }
+
+    sleeping = 0;
+    fm_x = fm_y = -1;
+    mouse_cursor_show();
+    gui_invalidate_all();
+    flush();
+}
+
+static void pw_do(int i) {
+    menu_close();
+    switch (i) {
+    case PW_EXIT:     quit_flag = 1; break;
+    case PW_SLEEP:    sleep_enter(); break;
+    case PW_SHUTDOWN: power_screen("Shutting down..."); power_prepare(); acpi_shutdown(); break;
+    case PW_RESTART:  power_screen("Restarting...");    power_prepare(); acpi_reboot();   break;
+    }
+}
+
 static void menu_key(const gui_key_t *k) {
     int c = k->code;
-    if (c == GUI_KEY_ESC)   { menu_close(); return; }
+    if (c == GUI_KEY_ESC) {
+        if (pw_open) { pw_open = 0; inv_menu(); }      /* Esc спершу ховає міні-меню */
+        else menu_close();
+        return;
+    }
+    if (c == GUI_KEY_TAB) {                            /* Tab — міні-меню живлення з клавіатури */
+        pw_open = !pw_open;
+        pw_sel = 0;
+        inv_menu();
+        return;
+    }
+    if (pw_open) {
+        if (c == GUI_KEY_ENTER) { pw_do(pw_sel); return; }
+        if (c == GUI_KEY_UP || c == GUI_KEY_DOWN) {
+            pw_sel = (pw_sel + (c == GUI_KEY_DOWN ? 1 : PW_N - 1)) % PW_N;
+            inv_menu();
+        }
+        return;
+    }
     if (c == GUI_KEY_ENTER) { menu_launch(menu_sel); return; }
     if (c == GUI_KEY_UP || c == GUI_KEY_DOWN) {
         if (!menu_nvis) return;
@@ -1395,7 +1642,7 @@ static void menu_key(const gui_key_t *k) {
         if (menu_qlen) { menu_qlen--; menu_refilter(); inv_menu(); }
         return;
     }
-    if (c >= 32 && c < 127 && menu_qlen < (int)sizeof(menu_q)) {
+    if (c < 256 && cs_printable(c) && menu_qlen < (int)sizeof(menu_q)) {
         menu_q[menu_qlen++] = (char)c;
         menu_refilter();
         inv_menu();
@@ -1431,7 +1678,9 @@ static void draw_menu(void) {
     gfx_fill(x + w - 1, y + 3, 1, h - 6, MC_BORDER);
 
     /* поле пошуку */
-    int sx = x + MENU_PAD, sy = y + MENU_PAD, sw = w - 2 * MENU_PAD;
+    draw_menu_side(x, y, w, h);
+
+    int sx = x + MENU_LX, sy = y + MENU_PAD, sw = w - MENU_LX - MENU_PAD;
     int ty = sy + (MENU_SEARCH_H - 18) / 2;
     gfx_rfill_a(sx, sy, sw, MENU_SEARCH_H, MC_SEARCH, 256);
     if (menu_qlen) {
@@ -1451,14 +1700,14 @@ static void draw_menu(void) {
         int v = menu_scroll + r;
         if (v >= menu_nvis) break;
         const menu_item_t *it = &menu_items[menu_vis[v]];
-        int cx = x + MENU_PAD, cy = ly + r * MENU_ROW_H;
+        int cx = x + MENU_LX, cy = ly + r * MENU_ROW_H;
         int on = (v == menu_sel);
         gfx_rfill_a(cx, cy, MENU_CARD_W, MENU_CARD_H, on ? MC_CARD_ON : MC_CARD, 256);
         draw_menu_icon(it->icon, cx + 8, cy + (MENU_CARD_H - 32) / 2, 2);
         gfx_text(cx + 8 + 32 + 12, cy + (MENU_CARD_H - 18) / 2, it->label, on ? 0xFFFFFF : MC_TEXT);
         gfx_char(cx + MENU_CARD_W - 20, cy + (MENU_CARD_H - 18) / 2, '>', on ? 0xFFFFFF : MC_DIM);
     }
-    if (!menu_nvis) gfx_text(x + MENU_PAD + 12, ly + 12, "No results", MC_DIM);
+    if (!menu_nvis) gfx_text(x + MENU_LX + 12, ly + 12, "No results", MC_DIM);
 
     /* смуга прокрутки */
     int lh = menu_list_h();
@@ -1471,6 +1720,8 @@ static void draw_menu(void) {
         tyy = ly + (lh - th) * menu_scroll / (menu_nvis - rows);
     }
     gfx_rfill_a(bx, tyy, MENU_SB_W, th, MC_THUMB, 256);
+
+    draw_power_popup();
 }
 
 static int ws_x0(void) { return (W - GUI_WORKSPACES * WS_CELL_W) / 2; }
@@ -1545,6 +1796,12 @@ static void draw_taskbar(void)
     gfx_text(W - 8 * 5 - 6,
          ty + (GUI_TASKBAR_H - 18) / 2,
          clock_txt,
+         C_TASKTEXT);
+
+    /* розкладка клавіатури (Ctrl+Shift або Alt+Shift) — ліворуч від годинника */
+    gfx_text(W - 8 * 5 - 6 - 8 * 3,
+         ty + (GUI_TASKBAR_H - 18) / 2,
+         keyboard_layout == KBD_LAYOUT_UA ? "UA" : "EN",
          C_TASKTEXT);
 }
 
@@ -1704,6 +1961,7 @@ static void flip(rect_t r) {
 }
 
 static void flush(void) {
+    if (sleeping) { nrr = nfr = 0; return; }   /* під час сну екран лишається чорним */
     if (!nrr && !nfr) return;
 
     rect_t out[2 * MAX_RECTS];
@@ -1764,6 +2022,8 @@ int gui_init(void) {
     quit_flag = 0;
     launcher = 0;
     start_open = 0;
+    pw_open = 0;
+    sleeping = 0;
     menu_count = 0;
     menu_nvis = 0;
     menu_qlen = 0;
@@ -2047,11 +2307,18 @@ static int kbd_poll(gui_key_t *out) {
         return 1;
     }
 
-    if (sc == 0x2A || sc == 0x36) { k_shift = !rel; return 0; }
-    if (sc == 0x1D)               { k_ctrl  = !rel; return 0; }
-    if (sc == 0x38)               { k_alt   = !rel; return 0; }
+    if (sc == 0x2A || sc == 0x36 || sc == 0x1D || sc == 0x38) {
+        if (sc == 0x2A || sc == 0x36) k_shift = !rel;
+        else if (sc == 0x1D)          k_ctrl  = !rel;
+        else                          k_alt   = !rel;
+        /* Ctrl+Shift / Alt+Shift: перемкнути розкладку (UA <-> EN) і перемалювати індикатор у панелі завдань */
+        if (keyboard_layout_track(k_ctrl, k_alt, k_shift, 0))
+            gui_invalidate_rect(W - 8 * 5 - 6 - 8 * 3 - 4, taskbar_y(), 8 * 8 + 12, GUI_TASKBAR_H);
+        return 0;
+    }
     if (rel) return 0;
     if (k_super) k_super_used = 1;               /* Super використано як модифікатор */
+    keyboard_layout_track(0, 0, 0, 1);           /* звичайна клавіша скасовує Ctrl+Shift / Alt+Shift */
     if (sc == 0x3A)               { k_caps = !k_caps; return 0; }
 
     int code = 0;
@@ -2078,9 +2345,8 @@ static int kbd_poll(gui_key_t *out) {
         case 0x3E: code = GUI_KEY_F4;        break;
         default:
             if (sc < 128) {
-                char c = k_shift ? keyboard_shift_map[sc]
-                       : k_caps  ? keyboard_caps_map[sc]
-                                 : keyboard_map[sc];
+                /* з Ctrl/Alt — завжди латиниця, щоб гарячі клавіші не залежали від розкладки */
+                char c = keyboard_translate(sc, k_shift, k_caps, k_ctrl || k_alt);
                 code = (unsigned char)c;
             }
             break;
@@ -2204,6 +2470,24 @@ static void on_press(int x, int y) {
         int mx, my, mw, mh;
         menu_rect(&mx, &my, &mw, &mh);
         if (in_rect(x, y, mx, my, mw, mh)) {
+            int bx, by;
+            pw_btn_rect(&bx, &by);
+            if (pw_open) {
+                int it = pw_item_at(x, y);
+                if (it >= 0) { pw_do(it); return; }
+                int qx, qy, qw, qh;
+                pw_rect(&qx, &qy, &qw, &qh);
+                pw_open = 0;                           /* клік повз міні-меню лише ховає його */
+                inv_menu();
+                if (in_rect(x, y, qx, qy, qw, qh) || in_rect(x, y, bx, by, PW_BTN, PW_BTN)) return;
+                return;
+            }
+            if (in_rect(x, y, bx, by, PW_BTN, PW_BTN)) {
+                pw_open = 1;
+                pw_sel = 0;
+                inv_menu();
+                return;
+            }
             menu_launch(menu_item_at(x, y));
             return;
         }
@@ -2291,6 +2575,8 @@ static void on_release(int x, int y) {
 }
 
 void gui_frame(void) {
+    if (sleeping) { sleep_poll(); return; }
+
     gui_key_t k;
     for (int n = 0; n < 64; n++) {
         int r = kbd_poll(&k);
@@ -2302,8 +2588,13 @@ void gui_frame(void) {
         const mouse_state_t *m = mouse_get();
 
         if (start_open) {
-            int hv = menu_item_at(m->x, m->y);
-            if (hv >= 0 && hv != menu_sel) { menu_sel = hv; inv_menu(); }
+            if (pw_open) {
+                int hp = pw_item_at(m->x, m->y);
+                if (hp >= 0 && hp != pw_sel) { pw_sel = hp; inv_menu(); }
+            } else {
+                int hv = menu_item_at(m->x, m->y);
+                if (hv >= 0 && hv != menu_sel) { menu_sel = hv; inv_menu(); }
+            }
         }
 
 #if GUI_FOCUS_FOLLOWS_MOUSE
@@ -2376,6 +2667,6 @@ void gui_frame(void) {
 void gui_run(void) {
     quit_flag = 0;
     flush();
-    while (!quit_flag) gui_frame();
+    while (!quit_flag) { gui_frame(); sched_yield(); }
     mouse_cursor_hide();
 }

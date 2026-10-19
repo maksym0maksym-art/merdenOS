@@ -95,7 +95,7 @@ static void vfmt(char *buf, int cap, const char *f, va_list ap)
             if (!s) s = "(null)";
             while (*s && d < end) {
                 char c = *s++;
-                *d++ = ((unsigned char)c >= 0x80) ? '?' : c;
+                *d++ = c;   /* CP1251: байти >= 0x80 — це кирилиця, шрифт їх малює */
             }
             break;
         }
@@ -108,7 +108,6 @@ static void vfmt(char *buf, int cap, const char *f, va_list ap)
     *d = 0;
 }
 
-/* ---- кільцевий буфер ---- */
 static void drop_oldest(void)
 {
     while (r_used && ring[r_tail] != '\n') { r_tail = (r_tail + 1) % KLOG_SIZE; r_used--; }

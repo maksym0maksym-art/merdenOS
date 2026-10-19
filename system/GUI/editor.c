@@ -4,6 +4,7 @@
 #include "../../kernel/headers/ram_files.h"
 #include "../../kernel/headers/usbfs.h"
 #include "syntax_c.h"
+#include "../../standarts_lib/charset.h"
 
 #define ED_MAX    32767
 #define RAM_MAX   1023
@@ -302,6 +303,12 @@ static void load_file(editor_t *e) {
                     e->name[1] == 's' &&
                     e->name[2] == 'b' &&
                     e->name[k] == ':';
+
+        if (!e->is_usb && e->name[0] == 'h' && e->name[1] == 'd') {      /* IDE-диск: hd0:/файл */
+            k = 2;
+            while (e->name[k] >= '0' && e->name[k] <= '9') k++;
+            e->is_usb = e->name[k] == ':';
+        }
     }
 
     if (e->is_usb) {
@@ -339,7 +346,7 @@ static void load_file(editor_t *e) {
                 continue;
             }
 
-            if ((unsigned char)c < 32 && c != '\n') c = '?';
+            if ((unsigned char)c < 32 && c != '\n') c = '?';   /* байти >= 0x80 — CP1251 (кирилиця), лишаємо */
 
             e->buf[n++] = c;
         }
@@ -579,7 +586,7 @@ static void ed_paint(gui_window_t *w, int x, int y,
 
                     char chr = e->buf[ci];
 
-                    if (chr < 32 || chr > 126)
+                    if (!cs_printable((unsigned char)chr))
                         chr = '?';
 
                     if (chr != ' ') {
@@ -834,7 +841,7 @@ static void ed_key(gui_window_t *w, const gui_key_t *k, void *ctx) {
         break;
 
     default:
-        if (code >= 32 && code <= 126) {
+        if (code < 256 && cs_printable(code)) {
             char c = (char)code;
             insert_text(e, &c, 1);
             touch(e);

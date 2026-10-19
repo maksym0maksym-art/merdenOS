@@ -3,6 +3,7 @@
 #include "../shell/shell.h"
 #include "../shell/graphic/console.h"
 #include "../../kernel/headers/usbfs.h"
+#include "../../standarts_lib/charset.h"
 
 #define TERM_MAX       3
 #define TERM_COLS_MAX  240
@@ -183,7 +184,7 @@ static void term_put(term_t *t, char c, uint32_t color) {
         while (n--) term_put(t, ' ', color);
         return;
     }
-    if ((c < 32 || c > 126) && !(c >= SP_ROSE_L && c <= SP_BOX_BL)) c = '?';
+    if (!cs_printable((unsigned char)c) && !(c >= SP_ROSE_L && c <= SP_BOX_BL)) c = '?';
 
     int cols = t->cols < 1 ? 1 : (t->cols > TERM_COLS_MAX ? TERM_COLS_MAX : t->cols);
     if (t->col >= cols) term_newline(t);
@@ -457,7 +458,7 @@ static void term_key(gui_window_t *w, const gui_key_t *k, void *ctx) {
             set_line(t, t->hpos < 0 ? t->saved : hist_get(t, t->hpos));
             edited = 1;
         }
-    } else if (code >= 32 && code <= 126) {
+    } else if (code < 256 && cs_printable(code)) {
         if (t->len < INPUT_MAX) {
             for (int i = t->len; i > t->pos; i--) t->line[i] = t->line[i - 1];
             t->line[t->pos++] = (char)code;

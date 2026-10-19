@@ -4,9 +4,15 @@
 #include <stdint.h>
 
 /*
- * Склейка USB-флешка (xHCI + MSC) + FAT32/exFAT для shell, терміналу та редактора.
+ * Склейка USB-флешка (xHCI + MSC) і IDE-диск + FAT32/exFAT для shell, терміналу та редактора.
  * Команди: `usb help`. Шляхи в редакторі: "usb:/dir/file.txt" (відносні — від `usb cd`).
+ * IDE-диски (legacy ATA, див. IDE_drive.h) монтуються при старті автоматично і працюють як флешки,
+ * тільки називаються hd0:, hd1:, ...
  */
+
+/* Номери дисків в API нижче: флешка usbN — це N (0..99), IDE-диск hdN — USBFS_IDE_BASE + N */
+#define USBFS_IDE_BASE     100
+#define USBFS_IS_IDE(d)    ((d) >= USBFS_IDE_BASE)
 
 /* Обробляє команду, що починається з "usb". Повертає 1, якщо команду оброблено. */
 int usbfs_command(const char *cmd);
@@ -32,13 +38,14 @@ typedef struct {
     uint32_t size;
 } usbfs_entry_t;
 
-int  usbfs_drive_count(void);                                   /* скільки флешок змонтовано */
-int  usbfs_drive_at(int i, char *label, int sz);                /* номер usbN: i-го змонтованого (-1 — нема); label = мітка або назва ФС */
+int  usbfs_drive_count(void);                                   /* скільки дисків змонтовано (флешки + IDE) */
+int  usbfs_drive_name(int drive, char *buf, int sz);            /* "usb0" / "hd0" (без двокрапки); повертає довжину */
+int  usbfs_drive_at(int i, char *label, int sz);                /* номер диска i-го змонтованого (-1 — нема); label = мітка або назва ФС */
 int  usbfs_drive_space(int drive, uint32_t *free_kb, uint32_t *total_kb);
 int  usbfs_list(int drive, const char *path, usbfs_entry_t *out, int max, int *count);   /* 0 або FAT_E_* */
 int  usbfs_remove(int drive, const char *path);                 /* файл або порожній каталог */
 int  usbfs_make(int drive, const char *path, int is_dir);
 int  usbfs_rename(int drive, const char *from, const char *to);
-int  usbfs_rescan(void);                                        /* знайти й змонтувати флешки; повертає кількість змонтованих */
+int  usbfs_rescan(void);                                        /* знайти й змонтувати флешки та IDE-диски; повертає кількість змонтованих */
 
 #endif

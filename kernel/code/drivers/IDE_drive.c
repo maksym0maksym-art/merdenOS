@@ -1,42 +1,66 @@
-#include "io.h"
-#include "../../headers/system.h"
-//#include "../../standarts_lib/stdio.h"
+/*
+ * Legacy IDE/ATA, PIO, LBA28. Див. опис і обмеження в headers/IDE_drive.h.
+ * Збірка для хост-тесту (-DIDE_HOST_TEST): порти й insw/outsw підміняються на ide_hw_*.
+ */
+#include <stdint.h>
+#include "../../headers/IDE_drive.h"
 
+#ifdef IDE_HOST_TEST
+extern uint8_t ide_hw_inb(uint16_t port);
+extern void    ide_hw_outb(uint16_t port, uint8_t v);
+extern void    ide_hw_insw(uint16_t port, void *buf, uint32_t words);
+extern void    ide_hw_outsw(uint16_t port, const void *buf, uint32_t words);
+#define HW_INB(p)          ide_hw_inb(p)
+#define HW_OUTB(p, v)      ide_hw_outb((p), (v))
+#define HW_INSW(p, b, n)   ide_hw_insw((p), (b), (n))
+#define HW_OUTSW(p, b, n)  ide_hw_outsw((p), (b), (n))
+#else
+static inline uint8_t hw_inb(uint16_t port)
+{
+    uint8_t r;
+    __asm__ volatile ("inb %1, %0" : "=a"(r) : "Nd"(port));
+    return r;
+}
+static inline void hw_outb(uint16_t port, uint8_t v)
+{
+    __asm__ volatile ("outb %0, %1" : : "a"(v), "Nd"(port));
+}
+static inline void hw_insw(uint16_t port, void *addr, uint32_t count)
+{
+    __asm__ volatile ("cld\n\trep insw" : "+D"(addr), "+c"(count) : "d"(port) : "memory");
+}
+static inline void hw_outsw(uint16_t port, const void *addr, uint32_t count)
+{
+    __asm__ volatile ("cld\n\trep outsw" : "+S"(addr), "+c"(count) : "d"(port) : "memory");
+}
+#define HW_INB(p)          hw_inb(p)
+#define HW_OUTB(p, v)      hw_outb((p), (v))
+#define HW_INSW(p, b, n)   hw_insw((p), (b), (n))
+#define HW_OUTSW(p, b, n)  hw_outsw((p), (b), (n))
+#endif
+
+/* статус */
 #define ATA_SR_BSY   0x80
-#define ATA_SR_DRDY  0x40
 #define ATA_SR_DF    0x20
-#define ATA_SR_DSC   0x10
 #define ATA_SR_DRQ   0x08
-#define ATA_SR_CORR  0x04
-#define ATA_SR_IDX   0x02
 #define ATA_SR_ERR   0x01
 
-#define ATA_ER_BBK   0x80
-#define ATA_ER_UNC   0x40
-#define ATA_ER_MC    0x20
-#define ATA_ER_IDNF  0x10
-#define ATA_ER_MCR   0x08
-#define ATA_ER_ABRT  0x04
-#define ATA_ER_TKONF 0x02
-#define ATA_ER_AMNF  0x01
-
+/* команди */
 #define ATA_CMD_READ_PIO        0x20
 #define ATA_CMD_WRITE_PIO       0x30
 #define ATA_CMD_CACHE_FLUSH     0xE7
-#define ATA_CMD_PACKET          0xA0
 #define ATA_CMD_IDENTIFY_PACKET 0xA1
 #define ATA_CMD_IDENTIFY        0xEC
 
+/* зсуви в 512-байтовій відповіді IDENTIFY (у байтах) */
 #define ATA_IDENT_DEVICETYPE   0
-#define ATA_IDENT_CAPABILITIES 98
 #define ATA_IDENT_MODEL        54
+#define ATA_IDENT_CAPABILITIES 98
+#define ATA_IDENT_MAX_LBA      120     /* слова 60-61: секторів, доступних через LBA28 */
 #define ATA_IDENT_COMMANDSETS  164
-#define ATA_IDENT_MAX_LBA      120
-#define ATA_IDENT_MAX_LBA_EXT  200
 
+/* регістри командного блоку (зсув від base) */
 #define ATA_REG_DATA       0x00
-#define ATA_REG_ERROR      0x01
-#define ATA_REG_FEATURES   0x01
 #define ATA_REG_SECCOUNT0  0x02
 #define ATA_REG_LBA0       0x03
 #define ATA_REG_LBA1       0x04
@@ -44,189 +68,147 @@
 #define ATA_REG_HDDEVSEL   0x06
 #define ATA_REG_COMMAND    0x07
 #define ATA_REG_STATUS     0x07
-#define ATA_REG_CONTROL    0x0C
-#define ATA_REG_ALTSTATUS  0x0C
 
 #define ATA_PRIMARY    0x00
 #define ATA_SECONDARY  0x01
 #define ATA_READ       0x00
 #define ATA_WRITE      0x01
-#define IDE_ATA        0x00
-#define IDE_ATAPI      0x01
 
-#define IDE_TIMEOUT_ITERS   100000
+#define IDE_POLL_ITERS      1000000u   /* очікування BSY/DRQ під час обміну даними (~1 с на залізі) */
+#define IDE_IDENT_ITERS     100000u    /* під час пошуку дисків — коротше, щоб порожні канали не гальмували */
+#define IDE_CHUNK_SECTORS   128u       /* за один виклик команди; регістр лічильника 8-бітний */
+#define IDE_LBA28_LIMIT     0x10000000u
 
-struct IDEChannelRegisters
-{
-    unsigned int  base;
-    unsigned int  ctrl;
-    unsigned int  bmide;
-    unsigned char nIEN;
-} channels[2];
+struct IDEChannelRegisters channels[2];
 
 unsigned char ide_buf[2048] = {0};
 unsigned char atapi_packet[12] = {0xA8, 0,0,0,0,0,0,0,0,0,0,0};
-
-struct ide_device_s
-{
-    unsigned char  Reserved;   
-    unsigned char  channel;
-    unsigned char  Drive;
-    unsigned short Type;
-    unsigned short Signature;
-    unsigned short Capabilities;
-    unsigned int   CommandSets;
-    unsigned int   Size;
-    unsigned char  Model[41];
-} ide_devices[4];
-
+struct ide_devices_s ide_devices[IDE_MAX_DRIVES];
 unsigned char package[2] = {0, 0};
+
+static blockdev_t ide_bd[IDE_MAX_DRIVES];
+
+/* ---------- низький рівень ---------- */
 
 static inline void io_delay(void)
 {
-        inb(0x80);
+    HW_OUTB(0x80, 0);
 }
 
-void ide_write(unsigned char channel, unsigned char reg, unsigned char data)
+static inline uint8_t reg_in(int ch, int reg)
 {
-    if (reg > 0x07 && reg < 0x0C)
-        ide_write(channel, ATA_REG_CONTROL, 0x80 | channels[channel].nIEN);
-
-    if (reg < 0x08)
-        outb(channels[channel].base + reg, data);
-    else if (reg < 0x0C)
-        outb(channels[channel].base + reg - 0x06, data);
-    else if (reg < 0x0E)
-        outb(channels[channel].ctrl + reg - 0x0A, data);
-    else if (reg < 0x16)
-        outb(channels[channel].bmide + reg - 0x0E, data);
-
-    if (reg > 0x07 && reg < 0x0C)
-        ide_write(channel, ATA_REG_CONTROL, channels[channel].nIEN);
+    return HW_INB((uint16_t)(channels[ch].base + reg));
 }
 
-unsigned char ide_read(unsigned char channel, unsigned char reg)
+static inline void reg_out(int ch, int reg, uint8_t v)
 {
-    unsigned char result = 0;
-
-    if (reg > 0x07 && reg < 0x0C)
-        ide_write(channel, ATA_REG_CONTROL, 0x80 | channels[channel].nIEN);
-
-    if (reg < 0x08)
-        result = inb(channels[channel].base + reg);
-    else if (reg < 0x0C)
-        result = inb(channels[channel].base + reg - 0x06);
-    else if (reg < 0x0E)
-        result = inb(channels[channel].ctrl + reg - 0x0A);
-    else if (reg < 0x16)
-        result = inb(channels[channel].bmide + reg - 0x0E);
-
-    if (reg > 0x07 && reg < 0x0C)
-        ide_write(channel, ATA_REG_CONTROL, channels[channel].nIEN);
-
-    return result;
+    HW_OUTB((uint16_t)(channels[ch].base + reg), v);
 }
 
-static inline void insw(unsigned short port, void *addr, unsigned int count)
+/* Alternate Status: те саме, що Status, але читання не гасить IRQ і безпечне для затримок */
+static inline uint8_t alt_status(int ch)
 {
-    asm volatile("cld\n\trep insw" : "+D"(addr), "+c"(count) : "d"(port) : "memory");
+    return HW_INB((uint16_t)channels[ch].ctrl);
 }
 
-static inline void outsw(unsigned short port, void *addr, unsigned int count)
+static inline void ctrl_out(int ch, uint8_t v)
 {
-    asm volatile("cld\n\trep outsw" : "+S"(addr), "+c"(count) : "d"(port) : "memory");
+    HW_OUTB((uint16_t)channels[ch].ctrl, v);
 }
 
-void ide_read_buffer(unsigned char channel, unsigned char reg, void *buffer, unsigned int words)
+/* 400 нс після вибору диска / видачі команди: чотири читання Alt Status */
+static void wait_400ns(int ch)
 {
-    if (reg < 0x08)
-        insw(channels[channel].base + reg, buffer, words);
-    else if (reg < 0x0C)
-        insw(channels[channel].base + reg - 0x06, buffer, words);
-}
-
-
-unsigned char ide_poll_status(unsigned char channel, unsigned int check_drq)
-{
-    
     for (int i = 0; i < 4; i++)
-        ide_read(channel, ATA_REG_ALTSTATUS);
+        (void)alt_status(ch);
+}
 
-    unsigned int timeout = 0;
-    unsigned char status;
+static uint16_t rd16(const unsigned char *b, int off)
+{
+    return (uint16_t)(b[off] | (b[off + 1] << 8));
+}
 
-    while ((status = ide_read(channel, ATA_REG_STATUS)) & ATA_SR_BSY)
-    {
-        if (++timeout > IDE_TIMEOUT_ITERS)
-            return 4;
-    }
+static uint32_t rd32(const unsigned char *b, int off)
+{
+    return (uint32_t)rd16(b, off) | ((uint32_t)rd16(b, off + 2) << 16);
+}
 
-    if (status & ATA_SR_ERR)
-        return 2;
+/* чекає BSY=0, потім (за потреби) DRQ=1 */
+static int ide_poll(int ch, int check_drq)
+{
+    wait_400ns(ch);
 
-    if (status & ATA_SR_DF)
-        return 1;
+    uint32_t t = 0;
+    uint8_t st;
 
-    if (check_drq)
-    {
-        timeout = 0;
-        while (!((status = ide_read(channel, ATA_REG_STATUS)) & ATA_SR_DRQ))
-        {
-            if (status & ATA_SR_ERR)
-                return 2;
+    while ((st = alt_status(ch)) & ATA_SR_BSY)
+        if (++t > IDE_POLL_ITERS)
+            return IDE_E_TIMEOUT;
 
-            if (++timeout > IDE_TIMEOUT_ITERS)
-                return 4;
+    if (st & ATA_SR_ERR) return IDE_E_ERR;
+    if (st & ATA_SR_DF)  return IDE_E_DF;
+
+    if (check_drq) {
+        t = 0;
+        while (!((st = alt_status(ch)) & ATA_SR_DRQ)) {
+            if (st & ATA_SR_ERR) return IDE_E_ERR;
+            if (st & ATA_SR_DF)  return IDE_E_DF;
+            if (++t > IDE_POLL_ITERS) return IDE_E_TIMEOUT;
         }
     }
-
-    return 0;
+    return IDE_OK;
 }
 
-static int ide_identify_device(unsigned char channel, unsigned char drive, int *out_type)
+static int ide_wait_not_busy(int ch)
 {
-    ide_write(channel, ATA_REG_HDDEVSEL, 0xA0 | (drive << 4));
+    uint32_t t = 0;
+    while (alt_status(ch) & ATA_SR_BSY)
+        if (++t > IDE_POLL_ITERS)
+            return IDE_E_TIMEOUT;
+    return IDE_OK;
+}
+
+/* ---------- пошук дисків ---------- */
+
+static int ide_identify_device(int ch, int drv, int *out_type)
+{
+    reg_out(ch, ATA_REG_HDDEVSEL, (uint8_t)(0xA0 | (drv << 4)));
     io_delay();
+    wait_400ns(ch);
 
-    unsigned char status = ide_read(channel, ATA_REG_STATUS);
-
+    uint8_t status = reg_in(ch, ATA_REG_STATUS);
     if (status == 0xFF)
-        return 0;
+        return 0;                       /* плаваюча шина: нічого не підключено */
 
-    ide_write(channel, ATA_REG_SECCOUNT0, 0);
-    ide_write(channel, ATA_REG_LBA0, 0);
-    ide_write(channel, ATA_REG_LBA1, 0);
-    ide_write(channel, ATA_REG_LBA2, 0);
-    ide_write(channel, ATA_REG_COMMAND, ATA_CMD_IDENTIFY);
+    reg_out(ch, ATA_REG_SECCOUNT0, 0);
+    reg_out(ch, ATA_REG_LBA0, 0);
+    reg_out(ch, ATA_REG_LBA1, 0);
+    reg_out(ch, ATA_REG_LBA2, 0);
+    reg_out(ch, ATA_REG_COMMAND, ATA_CMD_IDENTIFY);
     io_delay();
 
-    status = ide_read(channel, ATA_REG_STATUS);
+    status = reg_in(ch, ATA_REG_STATUS);
     if (status == 0)
-        return 0; 
+        return 0;                       /* пристрою нема */
 
-    unsigned int timeout = 0;
+    uint32_t timeout = 0;
     int type = IDE_ATA;
 
-    while (1)
-    {
-        status = ide_read(channel, ATA_REG_STATUS);
+    for (;;) {
+        status = reg_in(ch, ATA_REG_STATUS);
 
-        if (status & ATA_SR_ERR)
-        {
-            unsigned char cl = ide_read(channel, ATA_REG_LBA1);
-            unsigned char ch = ide_read(channel, ATA_REG_LBA2);
+        if (status & ATA_SR_ERR) {
+            uint8_t cl = reg_in(ch, ATA_REG_LBA1);
+            uint8_t chh = reg_in(ch, ATA_REG_LBA2);
 
-            if ((cl == 0x14 && ch == 0xEB) || (cl == 0x69 && ch == 0x96))
-            {
+            if ((cl == 0x14 && chh == 0xEB) || (cl == 0x69 && chh == 0x96)) {
                 type = IDE_ATAPI;
-                ide_write(channel, ATA_REG_COMMAND, ATA_CMD_IDENTIFY_PACKET);
+                reg_out(ch, ATA_REG_COMMAND, ATA_CMD_IDENTIFY_PACKET);
                 io_delay();
                 timeout = 0;
-                
-                while (!((status = ide_read(channel, ATA_REG_STATUS)) & ATA_SR_DRQ))
-                {
+                while (!((status = reg_in(ch, ATA_REG_STATUS)) & ATA_SR_DRQ)) {
                     if (status & ATA_SR_ERR) return 0;
-                    if (++timeout > IDE_TIMEOUT_ITERS) return 0;
+                    if (++timeout > IDE_IDENT_ITERS) return 0;
                 }
                 break;
             }
@@ -234,12 +216,12 @@ static int ide_identify_device(unsigned char channel, unsigned char drive, int *
         }
 
         if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRQ))
-            break; 
-        if (++timeout > IDE_TIMEOUT_ITERS)
-            return 0; 
+            break;
+        if (++timeout > IDE_IDENT_ITERS)
+            return 0;
     }
 
-    ide_read_buffer(channel, ATA_REG_DATA, ide_buf, 256);
+    HW_INSW((uint16_t)(channels[ch].base + ATA_REG_DATA), ide_buf, 256);
     *out_type = type;
     return 1;
 }
@@ -248,164 +230,231 @@ void ide_init(unsigned int BAR0, unsigned int BAR1,
               unsigned int BAR2, unsigned int BAR3,
               unsigned int BAR4)
 {
-    int count = 0;
+    /* BAR = 0 — класичні порти. У PCI-native BAR1/BAR3 вказують на блок із 4 портів,
+     * а Device Control/Alt Status лежить по зсуву +2. */
+    channels[ATA_PRIMARY].base   = BAR0 ? (BAR0 & 0xFFFFFFFCu) : 0x1F0;
+    channels[ATA_PRIMARY].ctrl   = BAR1 ? (BAR1 & 0xFFFFFFFCu) + 2 : 0x3F6;
+    channels[ATA_SECONDARY].base = BAR2 ? (BAR2 & 0xFFFFFFFCu) : 0x170;
+    channels[ATA_SECONDARY].ctrl = BAR3 ? (BAR3 & 0xFFFFFFFCu) + 2 : 0x376;
+    channels[ATA_PRIMARY].bmide   = BAR4 & 0xFFFFFFFCu;
+    channels[ATA_SECONDARY].bmide = (BAR4 & 0xFFFFFFFCu) + 8;
 
-    channels[ATA_PRIMARY].base    = (BAR0 & 0xFFFFFFFC) + 0x1F0 * (!BAR0);
-    channels[ATA_PRIMARY].ctrl    = (BAR1 & 0xFFFFFFFC) + 0x3F6 * (!BAR1);
-    channels[ATA_SECONDARY].base  = (BAR2 & 0xFFFFFFFC) + 0x170 * (!BAR2);
-    channels[ATA_SECONDARY].ctrl  = (BAR3 & 0xFFFFFFFC) + 0x376 * (!BAR3);
-    channels[ATA_PRIMARY].bmide   = (BAR4 & 0xFFFFFFFC);
-    channels[ATA_SECONDARY].bmide = (BAR4 & 0xFFFFFFFC) + 8;
-
+    /* nIEN = 1: працюємо поллінгом, IRQ14/15 не потрібні */
     channels[ATA_PRIMARY].nIEN   = 2;
     channels[ATA_SECONDARY].nIEN = 2;
-    ide_write(ATA_PRIMARY,   ATA_REG_CONTROL, 2);
-    ide_write(ATA_SECONDARY, ATA_REG_CONTROL, 2);
+    ctrl_out(ATA_PRIMARY,   2);
+    ctrl_out(ATA_SECONDARY, 2);
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < IDE_MAX_DRIVES; i++) {
         ide_devices[i].Reserved = 0;
+        ide_bd[i].ctx = 0;
+    }
 
-    for (unsigned char ch = 0; ch < 2; ch++)
-    {
-        for (unsigned char drv = 0; drv < 2; drv++)
-        {
+    int count = 0;
+    for (int ch = 0; ch < 2; ch++) {
+        for (int drv = 0; drv < 2; drv++) {
             int type = IDE_ATA;
 
             if (!ide_identify_device(ch, drv, &type))
-                continue; /* тут раніше могло зависнути назавжди */
+                continue;
 
-            ide_devices[count].Reserved  = 1;
-            ide_devices[count].Type      = type;
-            ide_devices[count].channel   = ch;
-            ide_devices[count].Drive     = drv;
-            ide_devices[count].Signature =
-                *((unsigned short *)(ide_buf + ATA_IDENT_DEVICETYPE));
-            ide_devices[count].Capabilities =
-                *((unsigned short *)(ide_buf + ATA_IDENT_CAPABILITIES));
-            ide_devices[count].CommandSets =
-                *((unsigned int *)(ide_buf + ATA_IDENT_COMMANDSETS));
+            struct ide_devices_s *d = &ide_devices[count];
+            d->Reserved     = 1;
+            d->Type         = (unsigned short)type;
+            d->channel      = (unsigned char)ch;
+            d->Drive        = (unsigned char)drv;
+            d->Signature    = rd16(ide_buf, ATA_IDENT_DEVICETYPE);
+            d->Capabilities = rd16(ide_buf, ATA_IDENT_CAPABILITIES);
+            d->CommandSets  = rd32(ide_buf, ATA_IDENT_COMMANDSETS);
+            d->Size         = rd32(ide_buf, ATA_IDENT_MAX_LBA);
 
-            if (ide_devices[count].CommandSets & (1 << 26))
-                ide_devices[count].Size =
-                    *((unsigned int *)(ide_buf + ATA_IDENT_MAX_LBA_EXT));
-            else
-                ide_devices[count].Size =
-                    *((unsigned int *)(ide_buf + ATA_IDENT_MAX_LBA));
-
-            for (int k = 0; k < 40; k += 2)
-            {
-                ide_devices[count].Model[k]     = ide_buf[ATA_IDENT_MODEL + k + 1];
-                ide_devices[count].Model[k + 1] = ide_buf[ATA_IDENT_MODEL + k];
+            for (int k = 0; k < 40; k += 2) {
+                d->Model[k]     = ide_buf[ATA_IDENT_MODEL + k + 1];
+                d->Model[k + 1] = ide_buf[ATA_IDENT_MODEL + k];
             }
-            ide_devices[count].Model[40] = 0;
+            d->Model[40] = 0;
+            for (int k = 39; k >= 0 && (d->Model[k] == ' ' || d->Model[k] == 0); k--)
+                d->Model[k] = 0;
 
-            for (int k = 39; k >= 0 && ide_devices[count].Model[k] == ' '; k--)
-                ide_devices[count].Model[k] = 0;
-
-            count++;
+            if (++count == IDE_MAX_DRIVES)
+                return;
         }
     }
 }
 
-unsigned char ide_ata_access(unsigned char direction, unsigned char drive,
-                              unsigned int lba, unsigned char numsects,
-                              unsigned char *buffer)
+int ide_drive_count(void)
 {
-    unsigned char channel  = ide_devices[drive].channel;
-    unsigned char slavebit = ide_devices[drive].Drive;
-    unsigned int  bus      = channels[channel].base;
-    unsigned char head     = (unsigned char)((lba >> 24) & 0x0F);
+    int n = 0;
+    for (int i = 0; i < IDE_MAX_DRIVES; i++)
+        if (ide_devices[i].Reserved)
+            n++;
+    return n;
+}
 
-    if (lba >= 0x10000000)
-        return 5; 
+const char *ide_strerror(int code)
+{
+    switch (code) {
+    case IDE_OK:        return "ok";
+    case IDE_E_DF:      return "device fault";
+    case IDE_E_ERR:     return "drive reported an error";
+    case IDE_E_NODRIVE: return "no such drive";
+    case IDE_E_TIMEOUT: return "timeout";
+    case IDE_E_RANGE:   return "LBA out of range";
+    case IDE_E_NOLBA:   return "drive has no LBA support";
+    case IDE_E_NOTATA:  return "not an ATA disk (ATAPI)";
+    default:            return "unknown error";
+    }
+}
 
+/* ---------- обмін даними ---------- */
+
+static int check_drive(int drive, uint32_t lba, uint32_t count)
+{
+    if (drive < 0 || drive >= IDE_MAX_DRIVES || !ide_devices[drive].Reserved)
+        return IDE_E_NODRIVE;
+    if (ide_devices[drive].Type != IDE_ATA)
+        return IDE_E_NOTATA;
     if (!(ide_devices[drive].Capabilities & 0x200))
-        return 6;
+        return IDE_E_NOLBA;
+    if ((uint64_t)lba + count > ide_devices[drive].Size ||
+        (uint64_t)lba + count > IDE_LBA28_LIMIT)
+        return IDE_E_RANGE;
+    return IDE_OK;
+}
 
-    unsigned int timeout = 0;
-    while (ide_read(channel, ATA_REG_STATUS) & ATA_SR_BSY)
-    {
-        if (++timeout > IDE_TIMEOUT_ITERS)
-            return 4;
+static int select_drive(int ch, int slave, uint32_t lba_top4)
+{
+    int e = ide_wait_not_busy(ch);
+    if (e) return e;
+    reg_out(ch, ATA_REG_HDDEVSEL, (uint8_t)(0xE0 | (slave << 4) | (lba_top4 & 0x0F)));
+    io_delay();
+    wait_400ns(ch);
+    return ide_wait_not_busy(ch);
+}
+
+/* одна команда READ/WRITE SECTORS на 1..128 секторів; межі вже перевірені */
+static int ata_pio(int direction, int drive, uint32_t lba, uint32_t n, void *buf)
+{
+    int ch    = ide_devices[drive].channel;
+    int slave = ide_devices[drive].Drive;
+    uint16_t data_port = (uint16_t)(channels[ch].base + ATA_REG_DATA);
+    uint8_t *p = (uint8_t *)buf;
+
+    int e = select_drive(ch, slave, lba >> 24);
+    if (e) return e;
+
+    reg_out(ch, ATA_REG_SECCOUNT0, (uint8_t)n);
+    reg_out(ch, ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
+    reg_out(ch, ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
+    reg_out(ch, ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
+    reg_out(ch, ATA_REG_COMMAND, direction == ATA_READ ? ATA_CMD_READ_PIO : ATA_CMD_WRITE_PIO);
+
+    for (uint32_t i = 0; i < n; i++) {
+        e = ide_poll(ch, 1);
+        if (e) return e;
+        if (direction == ATA_READ)
+            HW_INSW(data_port, p + i * IDE_SECTOR_SIZE, IDE_SECTOR_SIZE / 2);
+        else
+            HW_OUTSW(data_port, p + i * IDE_SECTOR_SIZE, IDE_SECTOR_SIZE / 2);
     }
 
-    ide_write(channel, ATA_REG_HDDEVSEL, 0xE0 | (slavebit << 4) | head);
-    ide_write(channel, ATA_REG_SECCOUNT0, numsects);
-    ide_write(channel, ATA_REG_LBA0, (unsigned char)(lba & 0xFF));
-    ide_write(channel, ATA_REG_LBA1, (unsigned char)((lba >> 8)  & 0xFF));
-    ide_write(channel, ATA_REG_LBA2, (unsigned char)((lba >> 16) & 0xFF));
+    if (direction == ATA_WRITE)
+        return ide_poll(ch, 0);         /* диск закінчує запис останнього сектора (BSY) і може видати ERR */
+    return IDE_OK;
+}
 
-    ide_write(channel, ATA_REG_COMMAND,
-              (direction == ATA_READ) ? ATA_CMD_READ_PIO : ATA_CMD_WRITE_PIO);
+int ide_read_blocks(int drive, uint32_t lba, uint32_t count, void *buf)
+{
+    int e = check_drive(drive, lba, count);
+    if (e) return e;
 
-    if (direction == ATA_READ)
-    {
-        for (int i = 0; i < numsects; i++)
-        {
-            unsigned char err = ide_poll_status(channel, 1);
-            if (err) return err;
-            insw(bus + ATA_REG_DATA, buffer + i * 512, 256);
-        }
+    uint8_t *p = (uint8_t *)buf;
+    while (count) {
+        uint32_t n = count > IDE_CHUNK_SECTORS ? IDE_CHUNK_SECTORS : count;
+        e = ata_pio(ATA_READ, drive, lba, n, p);
+        if (e) return e;
+        lba += n; count -= n; p += n * IDE_SECTOR_SIZE;
     }
-    else
-    {
-        for (int i = 0; i < numsects; i++)
-        {
-            unsigned char err = ide_poll_status(channel, 1);
-            if (err) return err;
-            outsw(bus + ATA_REG_DATA, buffer + i * 512, 256);
-        }
-        ide_write(channel, ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
-        ide_poll_status(channel, 0);
-    }
+    return IDE_OK;
+}
 
-    return 0;
+int ide_write_blocks(int drive, uint32_t lba, uint32_t count, const void *buf)
+{
+    int e = check_drive(drive, lba, count);
+    if (e) return e;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    while (count) {
+        uint32_t n = count > IDE_CHUNK_SECTORS ? IDE_CHUNK_SECTORS : count;
+        e = ata_pio(ATA_WRITE, drive, lba, n, (void *)p);
+        if (e) return e;
+        lba += n; count -= n; p += n * IDE_SECTOR_SIZE;
+    }
+    return IDE_OK;
+}
+
+int ide_flush_drive(int drive)
+{
+    int e = check_drive(drive, 0, 0);
+    if (e) return e;
+
+    int ch = ide_devices[drive].channel;
+    e = select_drive(ch, ide_devices[drive].Drive, 0);
+    if (e) return e;
+
+    reg_out(ch, ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
+    return ide_poll(ch, 0);
 }
 
 void ide_read_sectors(unsigned char drive, unsigned char numsects,
-                       unsigned int lba, unsigned char *buffer)
+                      unsigned int lba, unsigned char *buffer)
 {
-    if (drive > 3 || ide_devices[drive].Reserved == 0)
-    {
-        package[0] = 1;
-        return;
-    }
-
-    if (ide_devices[drive].Type != IDE_ATA)
-    {
-        package[0] = 7; 
-        return;
-    }
-
-    if ((lba + numsects) > ide_devices[drive].Size)
-    {
-        package[0] = 2; 
-        return;
-    }
-
-    package[0] = ide_ata_access(ATA_READ, drive, lba, numsects, buffer);
+    package[0] = (unsigned char)ide_read_blocks(drive, lba, numsects, buffer);
 }
 
 void ide_write_sectors(unsigned char drive, unsigned char numsects,
-                        unsigned int lba, unsigned char *buffer)
+                       unsigned int lba, unsigned char *buffer)
 {
-    if (drive > 3 || ide_devices[drive].Reserved == 0)
-    {
-        package[0] = 1;
-        return;
-    }
+    int e = ide_write_blocks(drive, lba, numsects, buffer);
+    if (e == IDE_OK)
+        e = ide_flush_drive(drive);
+    package[0] = (unsigned char)e;
+}
 
-    if (ide_devices[drive].Type != IDE_ATA)
-    {
-        package[0] = 4;
-        return;
-    }
+/* ---------- blockdev ---------- */
 
-    if ((lba + numsects) > ide_devices[drive].Size)
-    {
-        package[0] = 2;
-        return;
-    }
+static int bd_index(void *ctx)
+{
+    return (int)((struct ide_devices_s *)ctx - ide_devices);
+}
 
-    package[0] = ide_ata_access(ATA_WRITE, drive, lba, numsects, buffer);
+static int bd_read(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    return ide_read_blocks(bd_index(ctx), lba, count, buf) == IDE_OK ? 0 : -1;
+}
+
+static int bd_write(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    return ide_write_blocks(bd_index(ctx), lba, count, buf) == IDE_OK ? 0 : -1;
+}
+
+static int bd_flush(void *ctx)
+{
+    return ide_flush_drive(bd_index(ctx)) == IDE_OK ? 0 : -1;
+}
+
+blockdev_t *ide_blockdev(int drive)
+{
+    if (check_drive(drive, 0, 0) != IDE_OK)
+        return 0;
+
+    blockdev_t *bd = &ide_bd[drive];
+    bd->ctx         = &ide_devices[drive];
+    bd->block_size  = IDE_SECTOR_SIZE;
+    bd->block_count = ide_devices[drive].Size;
+    bd->read        = bd_read;
+    bd->write       = bd_write;
+    bd->flush       = bd_flush;
+    bd->read_only   = 0;
+    return bd;
 }

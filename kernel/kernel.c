@@ -18,6 +18,7 @@
 #include "../system/GUI/gui.h"
 #include "headers/pmm.h"
 #include "headers/memory.h"
+#include "headers/schluder.h"
 
 int blink_counter = 0;
 extern int shell_row, shell_col;
@@ -45,6 +46,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     }
 
     kheap_init();
+    scheduler_init();              /* слот 0 = цей потік; інші задачі — через add_tasks() */
 
     framebuffer_init(mbi_addr);
 
@@ -83,6 +85,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
         {
             keyboard_handler();
             blink_cursor();
+            sched_yield();                         /* віддати процесор фоновим задачам */
             if (mouse_poll()) {                    /* тачпад/миша гортають історію текстового шела */
                 const mouse_state_t *m = mouse_get();
                 if (m->wheel) console_scroll_view(m->wheel * 3);

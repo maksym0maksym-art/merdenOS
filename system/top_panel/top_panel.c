@@ -1,6 +1,7 @@
 #include "../../kernel/headers/framebuffer.h"
 #include "../../kernel/headers/rtc.h"
 #include "../../standarts_lib/stdio.h"
+#include "../../kernel/headers/keyboard.h"
 
 #define CHAR_WIDTH 8
 #define CHAR_HEIGHT 18
@@ -117,6 +118,10 @@ void draw_clock_panel(void)
     uint32_t time_x = framebuffer_width - time_width;
 
     color_draw_string_bg(time_buf, time_x, 0, 0x000000, 0x00FF00);
+
+    /* --- розкладка клавіатури (Ctrl+Shift або Alt+Shift), ліворуч від часу --- */
+    color_draw_string_bg(keyboard_layout == KBD_LAYOUT_UA ? "|UA" : "|EN",
+                         time_x - 3 * CHAR_WIDTH, 0, 0x000000, 0x00FF00);
 }
 
 void draw_top_panel(void)

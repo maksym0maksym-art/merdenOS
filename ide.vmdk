@@ -1,0 +1,19 @@
+# Disk DescriptorFile
+version=1
+CID=59058e94
+parentCID=ffffffff
+createType="monolithicFlat"
+
+# Extent description
+RW 131072 FLAT "ide.img" 0
+
+# The Disk Data Base 
+#DDB
+
+ddb.adapterType = "ide"
+ddb.encoding = "windows-1251"
+ddb.geometry.cylinders = "130"
+ddb.geometry.heads = "16"
+ddb.geometry.sectors = "63"
+ddb.longContentID = "433a6b41591784228e0ee03c59058e94"
+ddb.virtualHWVersion = "4"
